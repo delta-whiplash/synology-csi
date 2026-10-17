@@ -596,7 +596,10 @@ func (ns *nodeServer) nodeStageISCSIVolume(ctx context.Context, spec *models.Nod
 		return nil, status.Error(codes.Internal, "Can't get volume mount path")
 	}
 
-	if err := verifyIscsiDevice(volumeMountPath, iqn, lun, sysfsRoot); err != nil {
+	// Mount the resolved device, not the link: a by-path link repointed after
+	// the verification would otherwise still be followed by mount(2).
+	volumeMountPath, err = verifyIscsiDevice(volumeMountPath, iqn, lun, sysfsRoot)
+	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
@@ -957,6 +960,14 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		// the node's own partition. Only raw-block volumes skip staging and
 		// need a device path here.
 		if !isBlock {
+			if mounted, err := isStillMounted(ns.Mounter.Interface, stagingTargetPath); err != nil {
+				return nil, status.Error(codes.Internal, err.Error())
+			} else if !mounted {
+				// Bind-staging contract: publishing over an unstaged directory
+				// would give the pod a silently empty filesystem.
+				return nil, status.Error(codes.FailedPrecondition,
+					"staging target is not mounted: stage must complete before publish")
+			}
 			if err := ns.Mounter.Interface.Mount(stagingTargetPath, targetPath, fsType, options); err != nil {
 				return nil, status.Error(codes.Internal, err.Error())
 			}
@@ -973,7 +984,9 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			return nil, status.Error(codes.Internal, "Can't get volume mount path")
 		}
 
-		if err := verifyIscsiDevice(volumeMountPath, iqn, lun, sysfsRoot); err != nil {
+		// Mount the resolved device, not the link (same rationale as stage).
+		volumeMountPath, err = verifyIscsiDevice(volumeMountPath, iqn, lun, sysfsRoot)
+		if err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 
@@ -990,6 +1003,11 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 // authoritative /proc/mounts table decides. Var so tests can point it at a
 // fake mount table.
 var isStillMounted = func(mounter mount.Interface, path string) (bool, error) {
+	// The kernel records the resolved dentry path: a mount made through a
+	// symlinked component only matches here once the path is resolved too.
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		path = real
+	}
 	mounts, err := mount.ListProcMounts("/proc/mounts")
 	if err != nil {
 		return false, err
@@ -1020,7 +1038,7 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 		if os.IsNotExist(err) {
 			return &csi.NodeUnpublishVolumeResponse{}, nil
 		}
-		return nil, status.Errorf(codes.Internal, err.Error())
+		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 
 	// The "likely" fast check cannot see bind mounts of plain directories, and

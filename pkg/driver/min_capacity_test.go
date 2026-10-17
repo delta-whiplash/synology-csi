@@ -19,8 +19,8 @@ package driver
 import (
 	"testing"
 
-	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/SynologyOpenSource/synology-csi/pkg/utils"
+	"github.com/container-storage-interface/spec/lib/go/csi"
 )
 
 // TestParseMinVolumeSize verifies that the minVolumeSize StorageClass parameter

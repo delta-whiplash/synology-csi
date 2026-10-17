@@ -48,6 +48,7 @@ func iscsiMountPublishRequest(staging, target string) *csi.NodePublishVolumeRequ
 // device resolution races /dev/disk/by-* creation (no udev on Talos) and has
 // been observed handing a pod the node's local partition.
 func TestPublishBindsStagingWithoutTouchingDsm(t *testing.T) {
+	withFakeMountDetection(t)
 	base := t.TempDir()
 	staging := filepath.Join(base, "staging")
 	target := filepath.Join(base, "target")
@@ -69,7 +70,7 @@ func TestPublishBindsStagingWithoutTouchingDsm(t *testing.T) {
 	}
 
 	for _, mp := range fm.MountPoints {
-		if mp.Path == target && sliceContains(mp.Opts, "bind") {
+		if mp.Path == target && utils.SliceContains(mp.Opts, "bind") {
 			return // the bind from staging happened
 		}
 	}
@@ -153,15 +154,6 @@ func TestUnpublishReportsStillMountedInsteadOfLying(t *testing.T) {
 	}
 }
 
-func sliceContains(opts []string, want string) bool {
-	for _, o := range opts {
-		if o == want {
-			return true
-		}
-	}
-	return false
-}
-
 // stickyMounter wraps the fake and makes Unmount a no-op success while the
 // mount layer stays registered: exactly what a stuck EBUSY-less unmount looks
 // like to the caller.
@@ -170,3 +162,88 @@ type stickyMounter struct {
 }
 
 func (s *stickyMounter) Unmount(string) error { return nil }
+
+// Raw-block volumes skip staging: their publish is the one path that still
+// resolves a device through DSM+iSCSI. This pins the branch split.
+func TestRawBlockPublishStillResolvesThroughDsm(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "blockdev")
+	f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, 0o750)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	ns := &nodeServer{
+		Mounter:    &mount.SafeFormatAndMount{Interface: mount.NewFakeMounter(nil)},
+		dsmService: failingDsm{},
+	}
+	req := &csi.NodePublishVolumeRequest{
+		VolumeId:          "8029e1d2-8ea8-4e8a-ae5f-e4b9404885fa",
+		StagingTargetPath: filepath.Join(t.TempDir(), "staging"),
+		TargetPath:        target,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+		},
+		VolumeContext: map[string]string{"protocol": utils.ProtocolIscsi, "dsm": "10.10.146.6"},
+	}
+	if _, err := ns.NodePublishVolume(context.Background(), req); err == nil {
+		t.Fatal("raw-block publish must go through device resolution (DSM), not bind anything")
+	}
+}
+
+// Filesystem publish over an unstaged staging path must be refused: binding
+// an empty directory is a silently empty filesystem for the pod.
+func TestPublishRefusesUnstagedStaging(t *testing.T) {
+	withFakeMountDetection(t)
+	base := t.TempDir()
+	staging, target := filepath.Join(base, "staging"), filepath.Join(base, "target")
+	for _, d := range []string{staging, target} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ns := &nodeServer{
+		Mounter:    &mount.SafeFormatAndMount{Interface: mount.NewFakeMounter(nil)},
+		dsmService: failingDsm{},
+	}
+	if _, err := ns.NodePublishVolume(context.Background(), iscsiMountPublishRequest(staging, target)); err == nil {
+		t.Fatal("publish must refuse an unstaged staging path")
+	}
+}
+
+// Unpublish of a path that no longer exists is a success (kubelet relies on
+// the idempotency when reconstructing state).
+func TestUnpublishNonexistentTargetIsIdempotent(t *testing.T) {
+	ns := &nodeServer{Mounter: &mount.SafeFormatAndMount{Interface: mount.NewFakeMounter(nil)}}
+	if _, err := ns.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   "8029e1d2-8ea8-4e8a-ae5f-e4b9404885fa",
+		TargetPath: filepath.Join(t.TempDir(), "absent"),
+	}); err != nil {
+		t.Fatalf("unpublish of an absent target must succeed, got: %v", err)
+	}
+}
+
+// The peel bound: a mounter that never clears the layer must surface an error
+// after exactly maxUnmountPeels attempts, not loop forever.
+func TestUnpublishGivesUpAfterThePeelBound(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "mount")
+	if err := os.MkdirAll(target, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	ns := &nodeServer{Mounter: &mount.SafeFormatAndMount{Interface: &stickyMounter{Interface: mount.NewFakeMounter(nil)}}}
+	calls := 0
+	orig := isStillMounted
+	isStillMounted = func(m mount.Interface, p string) (bool, error) {
+		calls++
+		return true, nil
+	}
+	t.Cleanup(func() { isStillMounted = orig })
+	if _, err := ns.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   "8029e1d2-8ea8-4e8a-ae5f-e4b9404885fa",
+		TargetPath: target,
+	}); err == nil {
+		t.Fatal("unpublish must report the still-mounted layer as an error")
+	}
+	if calls != maxUnmountPeels+1 { // attempts + the final verification
+		t.Fatalf("expected %d seam reads (%d attempts + final check), got %d", maxUnmountPeels+1, maxUnmountPeels, calls)
+	}
+}

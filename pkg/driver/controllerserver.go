@@ -740,7 +740,7 @@ func (cs *controllerServer) ControllerExpandVolume(ctx context.Context, req *csi
 	}
 
 	nodeExpansion := false
-	if (k8sVolume.Protocol == utils.ProtocolIscsi || k8sVolume.Protocol == utils.ProtocolNvme) {
+	if k8sVolume.Protocol == utils.ProtocolIscsi || k8sVolume.Protocol == utils.ProtocolNvme {
 		nodeExpansion = true
 	}
 

@@ -51,12 +51,12 @@ func TestCreateVolume_DescriptionNamespaceDigits(t *testing.T) {
 			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
 		}},
 		Parameters: map[string]string{
-			"dsm":                                  "1.2.3.4",
-			"protocol":                             "iscsi",
-			"location":                             "/volume1",
-			"type":                                 "thin",
-			"csi.storage.k8s.io/pvc/name":          "data",
-			"csi.storage.k8s.io/pvc/namespace":     "12345",
+			"dsm":                              "1.2.3.4",
+			"protocol":                         "iscsi",
+			"location":                         "/volume1",
+			"type":                             "thin",
+			"csi.storage.k8s.io/pvc/name":      "data",
+			"csi.storage.k8s.io/pvc/namespace": "12345",
 		},
 	}
 
@@ -84,12 +84,12 @@ func TestCreateVolume_DescriptionNamespaceAlpha(t *testing.T) {
 			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
 		}},
 		Parameters: map[string]string{
-			"dsm":                                  "1.2.3.4",
-			"protocol":                             "iscsi",
-			"location":                             "/volume1",
-			"type":                                 "thin",
-			"csi.storage.k8s.io/pvc/name":          "data",
-			"csi.storage.k8s.io/pvc/namespace":     "pvc-x",
+			"dsm":                              "1.2.3.4",
+			"protocol":                         "iscsi",
+			"location":                         "/volume1",
+			"type":                             "thin",
+			"csi.storage.k8s.io/pvc/name":      "data",
+			"csi.storage.k8s.io/pvc/namespace": "pvc-x",
 		},
 	}
 
