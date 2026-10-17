@@ -950,6 +950,19 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 	default:
+		// A filesystem volume is guaranteed staged -- and its LUN identity
+		// verified -- before publish: bind the staging path and stop there.
+		// Re-logging-in at publish time raced /dev/disk/by-* creation on
+		// systems where those links lag behind the login, and has handed pods
+		// the node's own partition. Only raw-block volumes skip staging and
+		// need a device path here.
+		if !isBlock {
+			if err := ns.Mounter.Interface.Mount(stagingTargetPath, targetPath, fsType, options); err != nil {
+				return nil, status.Error(codes.Internal, err.Error())
+			}
+			return &csi.NodePublishVolumeResponse{}, nil
+		}
+
 		iscsiDevPaths, iqn, lun, err := ns.loginTarget(volumeId)
 		if err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
@@ -964,18 +977,34 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 
-		if isBlock {
-			err = ns.Mounter.Interface.Mount(volumeMountPath, targetPath, "", options)
-		} else {
-			err = ns.Mounter.Interface.Mount(stagingTargetPath, targetPath, fsType, options)
-		}
-		if err != nil {
+		if err := ns.Mounter.Interface.Mount(volumeMountPath, targetPath, "", options); err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 	}
 
 	return &csi.NodePublishVolumeResponse{}, nil
 }
+
+// isStillMounted reports whether path carries a live mount right now. The
+// "likely" fast check cannot see bind mounts of plain directories, so the
+// authoritative /proc/mounts table decides. Var so tests can point it at a
+// fake mount table.
+var isStillMounted = func(mounter mount.Interface, path string) (bool, error) {
+	mounts, err := mount.ListProcMounts("/proc/mounts")
+	if err != nil {
+		return false, err
+	}
+	for _, mp := range mounts {
+		if mp.Path == path {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// maxUnmountPeels bounds the stacked-bind teardown of one call; kubelet
+// retries NodeUnpublishVolume if layers remain.
+const maxUnmountPeels = 10
 
 func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 	if req.GetVolumeId() == "" { // Not needed, but still a mandatory field
@@ -994,22 +1023,32 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 		return nil, status.Errorf(codes.Internal, err.Error())
 	}
 
-	notMount, err := mount.IsNotMountPoint(ns.Mounter.Interface, targetPath)
-
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+	// The "likely" fast check cannot see bind mounts of plain directories, and
+	// reporting success on a mount that is still alive is how a migration left
+	// iSCSI sessions logged in forever: kubelet retries unpublish, never
+	// reaches unstage, and the next attach is refused Multi-Attach. Peel the
+	// layers against the authoritative mount table instead.
+	for i := 0; i < maxUnmountPeels; i++ {
+		mounted, err := isStillMounted(ns.Mounter.Interface, targetPath)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "Couldn't check whether %s is mounted: %v", targetPath, err)
+		}
+		if !mounted {
+			break
+		}
+		if err := ns.Mounter.Interface.Unmount(targetPath); err != nil {
+			return nil, status.Errorf(codes.Internal, "Failed to unmount %s: %v", targetPath, err)
+		}
 	}
 
-	if notMount {
-		return &csi.NodeUnpublishVolumeResponse{}, nil
+	if mounted, err := isStillMounted(ns.Mounter.Interface, targetPath); err != nil {
+		return nil, status.Errorf(codes.Internal, "Couldn't check whether %s is mounted: %v", targetPath, err)
+	} else if mounted {
+		return nil, status.Errorf(codes.Internal, "%s is still mounted after %d unmount attempts", targetPath, maxUnmountPeels)
 	}
 
-	if err := ns.Mounter.Interface.Unmount(targetPath); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-
-	if err := os.Remove(targetPath); err != nil {
-		return nil, status.Errorf(codes.Internal, "Failed to remove target path.")
+	if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+		return nil, status.Errorf(codes.Internal, "Failed to remove target path: %v", err)
 	}
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil

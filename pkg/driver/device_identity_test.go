@@ -125,13 +125,46 @@ func TestMultipathSlavesAreVerified(t *testing.T) {
 // Not being able to tell is logged, not fatal: the identity was never shown to
 // be wrong, and failing every mount on an unfamiliar sysfs layout would trade
 // a rare corruption for a common outage.
-func TestUnreadableSysfsDoesNotBlockTheMount(t *testing.T) {
+// Contract change (prod 2026-10-17: a pod was handed the node's local
+// partition through exactly this hole): an indeterminate identity now fails
+// the mount instead of passing vacuously. kubelet retries; a human looks.
+func TestUnreadableSysfsIsRefused(t *testing.T) {
 	root := t.TempDir()
 	dev := filepath.Join(root, "sdq") // no block/sdq at all
 	if err := os.WriteFile(dev, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyIscsiDevice(dev, rightIqn, 1, root); err != nil {
-		t.Errorf("an indeterminate identity should not fail the mount, got: %v", err)
+	if err := verifyIscsiDevice(dev, rightIqn, 1, root); err == nil {
+		t.Fatal("an unidentified device must be refused, not passed")
+	}
+}
+
+// A partition (sda4-style) has no /sys/block/<name>/device at all. The walk
+// cannot tell what it is handing over -- and a local partition is exactly
+// what must never be mounted as a volume, so this is an error, not a
+// vacuous pass (prod: vmsingle booted on the node's ephemeral partition).
+func TestPartitionDeviceIsRejected(t *testing.T) {
+	root := t.TempDir()
+	devPath := filepath.Join(root, "sda4")
+	if err := os.WriteFile(devPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// no sysfs tree whatsoever: nothing can identify this device
+	if err := verifyIscsiDevice(devPath, rightIqn, 1, filepath.Join(root, "sys")); err == nil {
+		t.Fatal("a device that cannot be identified must be refused, not passed")
+	}
+}
+
+// A devPath that does not resolve (a by-path link left dangling by a logout)
+// has an unknowable identity: refuse and let kubelet retry once the tree
+// settles.
+func TestUnresolvableDeviceIsRejected(t *testing.T) {
+	root := t.TempDir()
+	dangling := filepath.Join(root, "by-path-stale")
+	if err := os.Symlink(filepath.Join(root, "gone"), dangling); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyIscsiDevice(dangling, rightIqn, 1, filepath.Join(root, "sys")); err == nil {
+		t.Fatal("a devPath that does not resolve must be refused, not passed")
 	}
 }

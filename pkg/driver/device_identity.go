@@ -11,8 +11,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-
-	log "github.com/sirupsen/logrus"
 )
 
 // sysfsRoot is a var so tests can point the walk at a fabricated tree.
@@ -46,8 +44,8 @@ var sessionRe = regexp.MustCompile(`(^|/)(session\d+)(/|$)`)
 func verifyIscsiDevice(devPath, wantIqn string, wantLun int, sysfs string) error {
 	real, err := filepath.EvalSymlinks(devPath)
 	if err != nil {
-		log.Warnf("Couldn't resolve %s to verify its identity: %v", devPath, err)
-		return nil
+		return fmt.Errorf("device path %s does not resolve: %v -- an identity that "+
+			"cannot be read is never handed over (fail closed, kubelet will retry)", devPath, err)
 	}
 
 	names := []string{filepath.Base(real)}
@@ -55,8 +53,7 @@ func verifyIscsiDevice(devPath, wantIqn string, wantLun int, sysfs string) error
 		// A multipath device is only as trustworthy as its legs.
 		slaves, err := os.ReadDir(filepath.Join(sysfs, "block", filepath.Base(real), "slaves"))
 		if err != nil {
-			log.Warnf("Couldn't list the slaves of %s to verify its identity: %v", real, err)
-			return nil
+			return fmt.Errorf("couldn't list the slaves of %s to verify its identity: %v", real, err)
 		}
 		names = names[:0]
 		for _, s := range slaves {
@@ -67,8 +64,11 @@ func verifyIscsiDevice(devPath, wantIqn string, wantLun int, sysfs string) error
 	for _, name := range names {
 		canonical, err := filepath.EvalSymlinks(filepath.Join(sysfs, "block", name, "device"))
 		if err != nil {
-			log.Warnf("Couldn't read the kernel's view of %s: %v", name, err)
-			continue
+			// Partitions (sda4-style) and non-SCSI disks have no device link in
+			// sysfs: their identity is unknowable, and mounting one is how a pod
+			// ends up living on the node's local disk instead of its LUN.
+			return fmt.Errorf("couldn't read the kernel's view of %s (%s): %v -- refusing "+
+				"an unidentified device", devPath, name, err)
 		}
 
 		m := sessionRe.FindStringSubmatch(canonical)
@@ -90,8 +90,8 @@ func verifyIscsiDevice(devPath, wantIqn string, wantLun int, sysfs string) error
 
 		data, err := os.ReadFile(filepath.Join(sysfs, "class", "iscsi_session", session, "targetname"))
 		if err != nil {
-			log.Warnf("Couldn't read the target of %s (%s): %v", name, session, err)
-			continue
+			return fmt.Errorf("couldn't read the target of %s (%s): %v -- refusing an "+
+				"unidentified device", devPath, name, err)
 		}
 		gotIqn := strings.TrimSpace(string(data))
 
