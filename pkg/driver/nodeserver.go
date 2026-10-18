@@ -47,12 +47,16 @@ type nodeServer struct {
 	Driver     *Driver
 	Mounter    *mount.SafeFormatAndMount
 	dsmService interfaces.IDsmService
-	Initiator  *initiatorDriver
+	Initiator  initiator
 	Client     clientset.Interface
 	tools      tools
 }
 
-func waitForDevicePathToExist(path string) error {
+// waitForDevicePathToExist polls for a device node to show up after a login
+// or a rescan. Var so tests can short-circuit the 20-second wait: a fake node
+// has no /dev/disk at all, and the self-heal tests simulate the udev-less
+// shape where the link never appears.
+var waitForDevicePathToExist = func(path string) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	timer := time.NewTimer(20 * time.Second)
@@ -606,47 +610,54 @@ func (ns *nodeServer) nodeStageISCSIVolume(ctx context.Context, spec *models.Nod
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
-	iscsiDevPaths, iqn, lun, err := ns.loginTarget(spec.VolumeId)
-	if err != nil {
+	if err := ns.stageIscsiAt(spec.StagingTargetPath, spec.VolumeId, spec.VolumeCapability.GetMount(), utils.StringToSlice(spec.FormatOptions)); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	return &csi.NodeStageVolumeResponse{}, nil
+}
+
+// stageIscsiAt logs the volume's LUN in and mounts it at stagingTargetPath --
+// the whole staging sequence, shared by NodeStageVolume and by the publish
+// self-heal, which rebuilds a staging path whose "staged" state the kubelet
+// has skipped over. Errors come back bare; callers wrap the ones they want in
+// a gRPC status.
+func (ns *nodeServer) stageIscsiAt(stagingTargetPath, volumeId string, mountVolume *csi.VolumeCapability_MountVolume, formatOptions []string) error {
+	iscsiDevPaths, iqn, lun, err := ns.loginTarget(volumeId)
+	if err != nil {
+		return err
 	}
 
 	volumeMountPath := getVolumeMountPath(iscsiDevPaths)
 	if volumeMountPath == "" {
-		return nil, status.Error(codes.Internal, "Can't get volume mount path")
+		return errors.New("Can't get volume mount path")
 	}
 
 	// Mount the resolved device, not the link: a by-path link repointed after
 	// the verification would otherwise still be followed by mount(2).
 	volumeMountPath, err = verifyIscsiDevice(volumeMountPath, iqn, lun, sysfsRoot)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return err
 	}
 
-	notMount, err := ns.Mounter.Interface.IsLikelyNotMountPoint(spec.StagingTargetPath)
+	notMount, err := ns.Mounter.Interface.IsLikelyNotMountPoint(stagingTargetPath)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return err
 	}
 
 	if !notMount {
-		return &csi.NodeStageVolumeResponse{}, nil
+		return nil // already staged
 	}
 
-	fsType := spec.VolumeCapability.GetMount().GetFsType()
-	options := append([]string{"rw"}, spec.VolumeCapability.GetMount().GetMountFlags()...)
+	fsType := mountVolume.GetFsType()
+	options := append([]string{"rw"}, mountVolume.GetMountFlags()...)
 	options = withXfsMountOptions(fsType, options)
 
-	formatOptions := utils.StringToSlice(spec.FormatOptions)
-
-	if err = ns.Mounter.FormatAndMountSensitiveWithFormatOptions(volumeMountPath, spec.StagingTargetPath, fsType, options, nil, formatOptions); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+	if err := ns.Mounter.FormatAndMountSensitiveWithFormatOptions(volumeMountPath, stagingTargetPath, fsType, options, nil, formatOptions); err != nil {
+		return err
 	}
 
-	if err := ns.growFilesystemIfNeeded(volumeMountPath, spec.StagingTargetPath); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-
-	return &csi.NodeStageVolumeResponse{}, nil
+	return ns.growFilesystemIfNeeded(volumeMountPath, stagingTargetPath)
 }
 
 func (ns *nodeServer) nodeStageSMBVolume(ctx context.Context, spec *models.NodeStageVolumeSpec, secrets map[string]string) (*csi.NodeStageVolumeResponse, error) {
