@@ -18,6 +18,8 @@ var sysfsRoot = "/sys"
 
 var sessionRe = regexp.MustCompile(`(^|/)(session\d+)(/|$)`)
 
+var targetRe = regexp.MustCompile(`^target\d+:\d+:\d+$`)
+
 // verifyIscsiDevice checks that the device a by-path link resolved to really
 // belongs to the target and LUN this volume expects.
 //
@@ -143,4 +145,107 @@ func requireIscsiDisk(devPath, sysfs string) error {
 		}
 	}
 	return nil
+}
+
+// findSessionDevice locates the whole block device the kernel attached to
+// (iqn, lun) by walking sysfs -- the kernel's own view, no udev involved.
+// This is the discovery counterpart of verifyIscsiDevice: on udev-less nodes
+// (Talos) nothing scans a freshly logged-in session, so no device node ever
+// appears and the by-path links never come into existence; the only record
+// of the login is sysfs itself.
+//
+// The walk follows the kernel's layout: /sys/class/iscsi_session/<session>/
+// holds one entry per logged-in session with the target IQN in targetname;
+// that class entry resolves into the devices tree, where the session's
+// device directory holds a targetX:Y:Z directory per portal, each holding a
+// H:C:T:L directory per LUN, and each LUN directory exposes its disk under
+// block/<name>. Returns /dev/<name> of the first block device found for
+// (iqn, lun).
+//
+// The two failures are distinct on purpose: no session means the login did
+// not happen (or died) and has to be redone; a session without the lun
+// means the login happened but the device is not attached yet and only a
+// scan is missing. Callers retry both, but for different reasons.
+func findSessionDevice(iqn string, lun int, sysfs string) (string, error) {
+	classDir := filepath.Join(sysfs, "class", "iscsi_session")
+	sessions, err := os.ReadDir(classDir)
+	if err != nil {
+		return "", fmt.Errorf("couldn't list the iSCSI sessions under %s: %v", classDir, err)
+	}
+	var session string
+	for _, s := range sessions {
+		data, err := os.ReadFile(filepath.Join(classDir, s.Name(), "targetname"))
+		if err != nil {
+			// A session mid-login or mid-teardown may carry no targetname
+			// yet; it is not ours to judge, keep looking.
+			continue
+		}
+		if strings.TrimSpace(string(data)) == iqn {
+			session = s.Name()
+			break
+		}
+	}
+	if session == "" {
+		return "", fmt.Errorf("no iSCSI session for target[%s] under %s -- the login "+
+			"did not happen or is already gone", iqn, classDir)
+	}
+
+	// The class entry is a symlink into the devices tree:
+	// .../<session>/iscsi_session/<session>. Its parent's parent is the
+	// session's device directory, which holds the targetX:Y:Z directories.
+	canonical, err := filepath.EvalSymlinks(filepath.Join(classDir, session))
+	if err != nil {
+		return "", fmt.Errorf("couldn't resolve the sysfs path of session %s (target[%s]): %v",
+			session, iqn, err)
+	}
+	sessionDir := filepath.Dir(filepath.Dir(canonical))
+
+	targets, err := os.ReadDir(sessionDir)
+	if err != nil {
+		return "", fmt.Errorf("couldn't list the targets of session %s (target[%s]): %v",
+			session, iqn, err)
+	}
+	for _, tgt := range targets {
+		if !targetRe.MatchString(tgt.Name()) {
+			continue
+		}
+		lunDirs, err := os.ReadDir(filepath.Join(sessionDir, tgt.Name()))
+		if err != nil {
+			// Target mid-teardown; a live one will match elsewhere or the
+			// walk below reports the lun as missing.
+			continue
+		}
+		for _, h := range lunDirs {
+			gotLun, ok := lunOf(h.Name())
+			if !ok || gotLun != lun {
+				continue
+			}
+			blocks, err := os.ReadDir(filepath.Join(sessionDir, tgt.Name(), h.Name(), "block"))
+			if err != nil {
+				// The lun exists but carries no disk (yet): exactly the
+				// window this function exists for. Keep looking, report
+				// once the whole session has been walked.
+				continue
+			}
+			if len(blocks) > 0 {
+				// ReadDir sorts by name, so the pick is deterministic.
+				return filepath.Join("/dev", blocks[0].Name()), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("session %s is logged in to target[%s] but has no block device "+
+		"for lun %d -- the device is not attached (yet)", session, iqn, lun)
+}
+
+// lunOf parses the trailing LUN out of an H:C:T:L sysfs directory name.
+func lunOf(hctl string) (int, bool) {
+	parts := strings.Split(hctl, ":")
+	if len(parts) != 4 {
+		return -1, false
+	}
+	v, err := strconv.Atoi(parts[3])
+	if err != nil {
+		return -1, false
+	}
+	return v, true
 }

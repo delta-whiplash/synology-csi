@@ -14,14 +14,17 @@ const (
 	wrongIqn = "iqn.2000-01.com.synology:nas.pvc-wrong"
 )
 
-// fakeSysfs builds the slice of sysfs the verifier walks: a block device whose
-// canonical device path names an iSCSI session, and the session's targetname.
+// fakeSysfs builds the slice of sysfs the verifier and the session walk
+// traverse: a block device whose canonical device path names an iSCSI
+// session, the session's targetname, and the lun's disk exposed the way the
+// kernel does it (/<hctl>/block/<dev>). The class entry is a symlink into
+// the devices tree, as the kernel builds it.
 func fakeSysfs(t *testing.T, dev, session, hctl, iqn string) (sysfs, devPath string) {
 	t.Helper()
 	root := t.TempDir()
 
 	canonical := filepath.Join(root, "devices", "platform", "host6", session, "target6:0:0", hctl)
-	if err := os.MkdirAll(canonical, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(canonical, "block", dev), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	blockDir := filepath.Join(root, "block", dev)
@@ -32,11 +35,21 @@ func fakeSysfs(t *testing.T, dev, session, hctl, iqn string) (sysfs, devPath str
 		t.Fatal(err)
 	}
 
-	sessDir := filepath.Join(root, "class", "iscsi_session", session)
-	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+	// The kernel hangs a session off its device in the devices tree and
+	// symlinks the class entry to it: /sys/class/iscsi_session/<session> ->
+	// .../<host>/<session>/iscsi_session/<session>.
+	inner := filepath.Join(root, "devices", "platform", "host6", session, "iscsi_session", session)
+	if err := os.MkdirAll(inner, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(sessDir, "targetname"), []byte(iqn+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(inner, "targetname"), []byte(iqn+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	classDir := filepath.Join(root, "class", "iscsi_session")
+	if err := os.MkdirAll(classDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(inner, filepath.Join(classDir, session)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -168,6 +181,49 @@ func TestUnresolvableDeviceIsRejected(t *testing.T) {
 	}
 	if _, err := verifyIscsiDevice(dangling, rightIqn, 1, filepath.Join(root, "sys")); err == nil {
 		t.Fatal("a devPath that does not resolve must be refused, not passed")
+	}
+}
+
+// findSessionDevice is the discovery half of the story: on udev-less nodes
+// (Talos) nothing scans a freshly logged-in session, so no device node ever
+// appears and the by-path links are never created. Discovery has to start
+// from the session itself and walk the kernel's sysfs view.
+func TestFindSessionDeviceFindsTheLun(t *testing.T) {
+	sysfs, _ := fakeSysfs(t, "sdx", "session7", "6:0:0:1", rightIqn)
+	got, err := findSessionDevice(rightIqn, 1, sysfs)
+	if err != nil {
+		t.Fatalf("the session and the lun are both present, they must be found: %v", err)
+	}
+	if want := "/dev/sdx"; got != want {
+		t.Errorf("the device must come back as /dev/<name>, got %q want %q", got, want)
+	}
+}
+
+// No session carries the iqn: the login did not happen or is already gone.
+// That is a different condition from a lun without a device and must surface
+// as its own error, naming the target it could not find.
+func TestFindSessionDeviceWithoutSessionIsAnError(t *testing.T) {
+	sysfs, _ := fakeSysfs(t, "sdx", "session7", "6:0:0:1", wrongIqn)
+	_, err := findSessionDevice(rightIqn, 1, sysfs)
+	if err == nil {
+		t.Fatal("no session logged in to the wanted target: that must be an error")
+	}
+	if !strings.Contains(err.Error(), rightIqn) {
+		t.Errorf("the error should name the target no session serves, missing %q in: %v", rightIqn, err)
+	}
+}
+
+// The session is logged in but the lun has no block device behind it yet --
+// exactly the window between login and scan that self-healing has to ride
+// out. Must be an error, and distinct from the missing-session one.
+func TestFindSessionDeviceWithoutLunIsAnError(t *testing.T) {
+	sysfs, _ := fakeSysfs(t, "sdx", "session7", "6:0:0:2", rightIqn)
+	_, err := findSessionDevice(rightIqn, 1, sysfs)
+	if err == nil {
+		t.Fatal("the session has no device for this lun: that must be an error")
+	}
+	if strings.Contains(err.Error(), "no iSCSI session") {
+		t.Errorf("the error must be about the missing lun, not the session: %v", err)
 	}
 }
 
