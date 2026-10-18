@@ -7,6 +7,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,51 +47,49 @@ func iscsiMountPublishRequest(staging, target string) *csi.NodePublishVolumeRequ
 	}
 }
 
-// NodePublishVolume must bind the staging path for filesystem volumes and
-// never re-login or re-resolve devices: after a node migration the second
-// device resolution races /dev/disk/by-* creation (no udev on Talos) and has
-// been observed handing a pod the node's local partition.
-func TestPublishBindsStagingWithoutTouchingDsm(t *testing.T) {
+// A staging mounted from a proper iSCSI disk but carrying NO identity marker
+// (written by the pre-marker driver, say) cannot be proven to be this
+// volume's. The publish self-heals it -- unmount, re-stage, re-verify -- and
+// binds only the rebuilt staging: upgrading the driver must not wedge pods.
+func TestPublishSelfHealsAStagingWithoutIdentityMarker(t *testing.T) {
 	withFakeMountDetection(t)
-	// un staging backing device qui passe requireIscsiDisk (faux sysfs)
-	sysfs, iscsiDev := fakeSysfs(t, "sdx", "session7", "6:0:0:1", rightIqn)
-	oldSys := sysfsRoot
-	sysfsRoot = sysfs
-	t.Cleanup(func() { sysfsRoot = oldSys })
-	origSrc := stagingMountSource
-	stagingMountSource = func(path string) (string, bool) {
-		if path == filepath.Join(t.TempDir(), "never") {
-			return "", false
-		}
-		return iscsiDev, true
-	}
-	t.Cleanup(func() { stagingMountSource = origSrc })
+	withAbsentByPath(t)
+	_, iscsiDev := withFakeSysfs(t, pvcIqn)
+
 	base := t.TempDir()
-	staging := filepath.Join(base, "staging")
-	target := filepath.Join(base, "target")
+	staging, target := filepath.Join(base, "staging"), filepath.Join(base, "target")
 	for _, d := range []string{staging, target} {
 		if err := os.MkdirAll(d, 0o750); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	fm := mount.NewFakeMounter([]mount.MountPoint{{Device: "/dev/sdb", Path: staging}}) // staged LUN
-
-	ns := &nodeServer{
-		Mounter:    &mount.SafeFormatAndMount{Interface: fm},
-		dsmService: failingDsm{},
+	// mounted from the right LUN device, but the marker is missing
+	fm := mount.NewFakeMounter([]mount.MountPoint{{Device: iscsiDev, Path: staging}})
+	origSrc := stagingMountSource
+	stagingMountSource = func(path string) (string, bool) {
+		if path == staging {
+			return iscsiDev, true
+		}
+		return "", false
 	}
+	t.Cleanup(func() { stagingMountSource = origSrc })
 
-	if _, err := ns.NodePublishVolume(context.Background(), iscsiMountPublishRequest(staging, target)); err != nil {
-		t.Fatalf("filesystem publish must bind staging without DSM/iSCSI access, got: %v", err)
-	}
-
-	for _, mp := range fm.MountPoints {
-		if mp.Path == target && utils.SliceContains(mp.Opts, "bind") {
-			return // the bind from staging happened
+	initr := &fakeInitiator{}
+	initr.stage = func() {
+		if err := fm.Mount(iscsiDev, staging, "xfs", []string{"rw"}); err != nil {
+			t.Errorf("fake stage mount failed: %v", err)
 		}
 	}
-	t.Fatalf("publish did not bind staging %s onto %s; mounted: %v", staging, target, fm.MountPoints)
+
+	ns := selfHealNode(fm, initr)
+	if _, err := ns.NodePublishVolume(context.Background(), iscsiMountPublishRequest(staging, target)); err != nil {
+		t.Fatalf("publish must rebuild a staging without an identity marker, got: %v", err)
+	}
+	if _, err := os.Stat(staging + ".identity"); err != nil {
+		t.Fatalf("the rebuilt staging must carry an identity marker: %v", err)
+	}
+	assertBind(t, fm, staging, target)
 }
 
 // A successful Unmount peels exactly one layer of a stacked bind. Publishing
@@ -533,8 +532,9 @@ func TestPublishSelfHealsAStagingBackedByAnotherDisk(t *testing.T) {
 	}
 }
 
-// AC3: the staging path already holds a verified iSCSI disk -- the fast
-// path. Binding must be the whole story: zero logins, zero DSM.
+// AC3: the staging path provably holds this volume's LUN -- mounted, backed
+// by a verified iSCSI disk, identity marker matching. Binding must be the
+// whole story: one DSM read for the expected identity, zero iSCSI logins.
 func TestPublishBindsAVerifiedStagingWithoutAnyLogin(t *testing.T) {
 	withFakeMountDetection(t)
 	_, iscsiDev := withFakeSysfs(t, pvcIqn)
@@ -548,6 +548,10 @@ func TestPublishBindsAVerifiedStagingWithoutAnyLogin(t *testing.T) {
 	}
 
 	fm := mount.NewFakeMounter([]mount.MountPoint{{Device: iscsiDev, Path: staging}})
+	// the stage left a matching identity marker next to the staging path
+	if err := os.WriteFile(staging+".identity", fakeMarker(pvcIqn, 1, "8029e1d2-8ea8-4e8a-ae5f-e4b9404885fa"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	origSrc := stagingMountSource
 	stagingMountSource = func(path string) (string, bool) {
 		if path == staging {
@@ -560,7 +564,7 @@ func TestPublishBindsAVerifiedStagingWithoutAnyLogin(t *testing.T) {
 	initr := &fakeInitiator{}
 	ns := &nodeServer{
 		Mounter:    &mount.SafeFormatAndMount{Interface: fm},
-		dsmService: failingDsm{},
+		dsmService: liveDsm{}, // identity lookup: a read, never an iSCSI login
 		Initiator:  initr,
 	}
 	if _, err := ns.NodePublishVolume(context.Background(), iscsiMountPublishRequest(staging, target)); err != nil {
@@ -713,5 +717,63 @@ func TestResolveStageDeviceWalksSysfsOnMonoPath(t *testing.T) {
 	}
 	if got != dev {
 		t.Errorf("expected the walked device %s, got %q", dev, got)
+	}
+}
+
+// fakeMarker renders the identity marker the way the stage writes it next to
+// a staging path -- fixture for a staging that already carries one.
+func fakeMarker(iqn string, lun int, volumeId string) []byte {
+	return []byte(fmt.Sprintf("iqn=%s\nlun=%d\nvolumeId=%s\n", iqn, lun, volumeId))
+}
+
+// A staging whose identity marker names ANOTHER volume is exactly the
+// corruption incident #17 produced: the device behind it is a real iSCSI
+// disk, so "is an iSCSI disk" alone would bind it. The publish must try to
+// rebuild -- and when the right LUN is nowhere to be found, refuse for good.
+func TestPublishRefusesAStagingMarkedForAnotherVolume(t *testing.T) {
+	withFakeMountDetection(t)
+	withAbsentByPath(t)
+	_, iscsiDev := withFakeSysfs(t, wrongIqn) // the session in sysfs is NOT this volume's
+	// no re-stage possible: the scan never brings this volume's lun
+	origWait := waitForSessionDevice
+	waitForSessionDevice = func(string, int, string) (string, error) {
+		return "", errors.New("no scan in this test")
+	}
+	t.Cleanup(func() { waitForSessionDevice = origWait })
+
+	base := t.TempDir()
+	staging, target := filepath.Join(base, "staging"), filepath.Join(base, "target")
+	for _, d := range []string{staging, target} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// staged for ANOTHER volume: the marker says so
+	if err := os.WriteFile(staging+".identity", fakeMarker(wrongIqn, 1, "another-volume"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	fm := mount.NewFakeMounter([]mount.MountPoint{{Device: iscsiDev, Path: staging}})
+	origSrc := stagingMountSource
+	stagingMountSource = func(path string) (string, bool) {
+		if path == staging {
+			return iscsiDev, true
+		}
+		return "", false
+	}
+	t.Cleanup(func() { stagingMountSource = origSrc })
+
+	initr := &fakeInitiator{}
+	ns := selfHealNode(fm, initr)
+	if _, err := ns.NodePublishVolume(context.Background(), iscsiMountPublishRequest(staging, target)); err == nil {
+		t.Fatal("publish must refuse a staging whose identity marker names another volume")
+	}
+	if initr.logins == 0 {
+		t.Fatal("publish must try to rebuild the staging, not refuse it untouched")
+	}
+	for _, mp := range fm.MountPoints {
+		if mp.Path == target {
+			t.Fatalf("nothing may be bound onto the target: %v", fm.MountPoints)
+		}
 	}
 }

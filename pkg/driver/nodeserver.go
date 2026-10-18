@@ -279,13 +279,9 @@ func (ns *nodeServer) logoutNVMeSubsystem(nqn string) {
 // device links, along with the target IQN and LUN number they are supposed to
 // stand for -- the caller is expected to verify that before trusting them.
 func (ns *nodeServer) loginTarget(volumeId string) (paths []string, iqn string, lun int, err error) {
-	k8sVolume, err := ns.dsmService.GetVolume(volumeId)
+	k8sVolume, err := ns.lookupIscsiVolume(volumeId)
 	if err != nil {
-		return nil, "", 0, status.Errorf(codes.Unavailable,
-			"Couldn't determine whether volume[%s] exists: %v", volumeId, err)
-	}
-	if k8sVolume == nil {
-		return nil, "", 0, status.Error(codes.NotFound, fmt.Sprintf("Volume[%s] is not found", volumeId))
+		return nil, "", 0, err
 	}
 
 	portals := ns.getPortals(k8sVolume.DsmIp)
@@ -673,6 +669,15 @@ func (ns *nodeServer) stageIscsiAt(stagingTargetPath, volumeId string, mountVolu
 		return err
 	}
 
+	// The device just proved to be this volume's LUN: record it next to the
+	// staging path -- the publish compares the marker against what DSM says
+	// the volume is, since "an iSCSI disk" alone is not "THIS volume's disk".
+	// Written before the mount-point check on purpose: a staging found
+	// already mounted still gets its freshly verified identity.
+	if err := writeIscsiIdentityMarker(stagingTargetPath, iqn, lun, volumeId); err != nil {
+		return err
+	}
+
 	notMount, err := ns.Mounter.Interface.IsLikelyNotMountPoint(stagingTargetPath)
 	if err != nil {
 		return err
@@ -869,6 +874,12 @@ func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 		}
 	}
 
+	// The identity marker lives outside the mount; drop it once the staging
+	// is down so a later re-use of the path cannot inherit a stale identity.
+	if err := os.Remove(stagingTargetPath + identityMarkerSuffix); err != nil && !os.IsNotExist(err) {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
 	k8sVolume, err := ns.dsmService.GetVolume(volumeId)
 	if err != nil {
 		// Claiming the volume is unstaged could leave an iSCSI session logged
@@ -1032,23 +1043,32 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			if err != nil {
 				return nil, status.Error(codes.Internal, err.Error())
 			}
-			// The kubelet can skip staging when its cached state says "already
-			// staged", leaving whatever the staging path held at reconstruction
-			// time -- observed in production as a pod living on the node's own
-			// partition, or holding nothing at all. When the staging does not
-			// provably carry an iSCSI disk, rebuild it instead of refusing:
-			// the refusal wedged pods forever, the kubelet never re-stages on
-			// its own.
-			if !stagingBackedByIscsiDisk(stagingTargetPath) {
-				log.Warnf("NodePublishVolume: staging %s does not hold a verified iSCSI disk (mounted: %v), self-healing it",
-					stagingTargetPath, mounted)
+			// What the staging must hold: the identity DSM assigns to THIS
+			// volume. requireIscsiDisk alone proves "an iSCSI disk" -- the
+			// marker proves "the LUN this volume was staged from" (prod
+			// 2026-10-17: a pod was handed a staging carrying another disk).
+			// When the staging does not provably hold it, rebuild it instead
+			// of refusing: the refusal wedged pods forever, the kubelet never
+			// re-stages on its own.
+			k8sVolume, err := ns.lookupIscsiVolume(volumeId)
+			if err != nil {
+				return nil, err
+			}
+			expectedIqn := k8sVolume.Target.Iqn
+			expectedLun := k8sVolume.Target.MappedLuns[0].MappingIndex
+			trusted := mounted && stagingBackedByIscsiDisk(stagingTargetPath) &&
+				stagingIdentityMatches(stagingTargetPath, expectedIqn, expectedLun, volumeId)
+			if !trusted {
+				log.Warnf("NodePublishVolume: staging %s does not provably hold target[%s] lun %d (mounted: %v), self-healing it",
+					stagingTargetPath, expectedIqn, expectedLun, mounted)
 				if err := ns.selfHealIscsiStaging(stagingTargetPath, volumeId, mounted, req.GetVolumeCapability().GetMount()); err != nil {
 					return nil, status.Errorf(codes.FailedPrecondition,
-						"staging target is not backed by a verified iSCSI disk and healing it failed: %v", err)
+						"staging target does not provably hold this volume's LUN and healing it failed: %v", err)
 				}
-				if !stagingBackedByIscsiDisk(stagingTargetPath) {
+				if !stagingBackedByIscsiDisk(stagingTargetPath) ||
+					!stagingIdentityMatches(stagingTargetPath, expectedIqn, expectedLun, volumeId) {
 					return nil, status.Error(codes.FailedPrecondition,
-						"staging target still does not hold a verified iSCSI disk after the self-heal")
+						"staging target still does not provably hold this volume's LUN after the self-heal")
 				}
 			}
 			if err := ns.Mounter.Interface.Mount(stagingTargetPath, targetPath, fsType, options); err != nil {
@@ -1124,6 +1144,48 @@ func (ns *nodeServer) selfHealIscsiStaging(stagingTargetPath, volumeId string, m
 		return fmt.Errorf("failed to create the staging directory %s: %v", stagingTargetPath, err)
 	}
 	return ns.stageIscsiAt(stagingTargetPath, volumeId, mountVolume, nil)
+}
+
+// identityMarkerSuffix names the file recording, next to a staging path, the
+// LUN identity the stage verified for it. A sibling of the staging directory,
+// not a file inside it: the staging mount shadows its own directory's
+// content, and the publish must read the marker while the staging is
+// mounted.
+const identityMarkerSuffix = ".identity"
+
+// writeIscsiIdentityMarker records the verified identity of a staging:
+// target IQN, LUN index and the volume they belong to.
+func writeIscsiIdentityMarker(stagingTargetPath, iqn string, lun int, volumeId string) error {
+	content := fmt.Sprintf("iqn=%s\nlun=%d\nvolumeId=%s\n", iqn, lun, volumeId)
+	if err := os.WriteFile(stagingTargetPath+identityMarkerSuffix, []byte(content), 0o600); err != nil {
+		return fmt.Errorf("failed to record the identity of staging %s: %v", stagingTargetPath, err)
+	}
+	return nil
+}
+
+// stagingIdentityMatches reports whether the marker next to the staging path
+// names exactly the expected volume identity. A missing, stale or foreign
+// marker means the staging is not provably this volume's.
+func stagingIdentityMatches(stagingTargetPath, iqn string, lun int, volumeId string) bool {
+	data, err := os.ReadFile(stagingTargetPath + identityMarkerSuffix)
+	if err != nil {
+		return false
+	}
+	return string(data) == fmt.Sprintf("iqn=%s\nlun=%d\nvolumeId=%s\n", iqn, lun, volumeId)
+}
+
+// lookupIscsiVolume resolves the identity DSM assigns to a volume -- the
+// target IQN and mapped LUN a staging of this volume has to prove.
+func (ns *nodeServer) lookupIscsiVolume(volumeId string) (*models.K8sVolumeRespSpec, error) {
+	k8sVolume, err := ns.dsmService.GetVolume(volumeId)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable,
+			"Couldn't determine whether volume[%s] exists: %v", volumeId, err)
+	}
+	if k8sVolume == nil {
+		return nil, status.Error(codes.NotFound, fmt.Sprintf("Volume[%s] is not found", volumeId))
+	}
+	return k8sVolume, nil
 }
 
 // isStillMounted reports whether path carries a live mount right now. The
