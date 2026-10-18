@@ -18,6 +18,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -1066,6 +1067,13 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	}
 
 	if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+		if errors.Is(err, unix.ENOTEMPTY) || errors.Is(err, unix.EEXIST) {
+			// The mount is verifiably gone; whatever sits in the directory is
+			// leftover content for the kubelet's pod-dir GC, not a reason to
+			// wedge this pod's deletion forever.
+			log.Infof("NodeUnpublishVolume: %s still has leftover content, leaving it to kubelet GC", targetPath)
+			return &csi.NodeUnpublishVolumeResponse{}, nil
+		}
 		return nil, status.Errorf(codes.Internal, "Failed to remove target path: %v", err)
 	}
 

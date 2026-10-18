@@ -247,3 +247,25 @@ func TestUnpublishGivesUpAfterThePeelBound(t *testing.T) {
 		t.Fatalf("expected %d seam reads (%d attempts + final check), got %d", maxUnmountPeels+1, maxUnmountPeels, calls)
 	}
 }
+
+// The mount is verifiably gone but the target directory carries leftover
+// content (a bad earlier state can leave a whole filesystem's worth of files
+// in it): removing that content is the kubelet's pod-dir GC business, not this
+// RPC's. ENOTEMPTY must not turn into a wedged pod.
+func TestUnpublishToleratesLeftoverDirectoryContent(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "mount")
+	if err := os.MkdirAll(filepath.Join(target, "data"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "flock.lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// no fake mount layer: the mount is already gone, only the files remain
+	ns := &nodeServer{Mounter: &mount.SafeFormatAndMount{Interface: mount.NewFakeMounter(nil)}}
+	if _, err := ns.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
+		VolumeId:   "8029e1d2-8ea8-4e8a-ae5f-e4b9404885fa",
+		TargetPath: target,
+	}); err != nil {
+		t.Fatalf("unpublish must succeed once the mount is verified gone, got: %v", err)
+	}
+}
