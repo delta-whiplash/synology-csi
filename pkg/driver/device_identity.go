@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // sysfsRoot is a var so tests can point the walk at a fabricated tree.
@@ -21,6 +22,16 @@ var sysfsRoot = "/sys"
 // Var so tests can point it at the same fabricated tree as sysfsRoot, where
 // the stand-in /dev/<name> nodes live.
 var devDir = "/dev"
+
+// sessionPollInterval spaces the re-reads of the sysfs walk while the kernel
+// scan of a freshly logged-in lun completes. Var so tests can shrink it.
+var sessionPollInterval = time.Second
+
+// waitForSessionDevice returns the block device the kernel attached to
+// (iqn, lun), resolved from sysfs. Var so tests can stand the walk in.
+var waitForSessionDevice = func(iqn string, lun int, sysfs string) (string, error) {
+	return findSessionDevice(iqn, lun, sysfs)
+}
 
 var sessionRe = regexp.MustCompile(`(^|/)(session\d+)(/|$)`)
 

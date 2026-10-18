@@ -637,7 +637,7 @@ func (ns *nodeServer) stageIscsiAt(stagingTargetPath, volumeId string, mountVolu
 	// (Talos) never create the /dev/disk/by-path links, so discovery has to
 	// start from the session the kernel actually recorded; the by-path links
 	// stay as the fallback for the nodes that do have them.
-	volumeMountPath, findErr := findSessionDevice(iqn, lun, sysfsRoot)
+	volumeMountPath, findErr := waitForSessionDevice(iqn, lun, sysfsRoot)
 	if findErr != nil {
 		log.Warnf("sysfs discovery of target[%s] lun %d failed (%v), falling back to the by-path links", iqn, lun, findErr)
 		volumeMountPath = getVolumeMountPath(iscsiDevPaths)
