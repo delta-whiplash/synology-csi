@@ -9,7 +9,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"k8s.io/mount-utils"
@@ -598,5 +600,89 @@ func TestPublishReportsAFailedSelfHealLoginAndBindsNothing(t *testing.T) {
 		if mp.Path == target {
 			t.Fatalf("nothing may be bound onto the target on a failed self-heal: %v", fm.MountPoints)
 		}
+	}
+}
+
+// The kernel scans a freshly logged-in session asynchronously: the first
+// sysfs read after a login legitimately misses the lun. The stage must ride
+// that window out with a bounded poll -- failing the first read makes every
+// kubelet retry pay the whole login again.
+func TestPublishSelfHealToleratesALateKernelScan(t *testing.T) {
+	withFakeMountDetection(t)
+	withAbsentByPath(t)
+	sysfs, iscsiDev := withFakeSysfs(t, pvcIqn)
+	// logged in but not scanned: the lun carries no disk yet
+	canonical, err := filepath.EvalSymlinks(filepath.Join(sysfs, "block", "sdx", "device"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockDir := filepath.Join(canonical, "block")
+	if err := os.RemoveAll(blockDir); err != nil {
+		t.Fatal(err)
+	}
+	origInterval := sessionPollInterval
+	sessionPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() { sessionPollInterval = origInterval })
+
+	base := t.TempDir()
+	staging, target := filepath.Join(base, "staging"), filepath.Join(base, "target")
+	for _, d := range []string{staging, target} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fm := mount.NewFakeMounter(nil)
+	initr := &fakeInitiator{}
+	staged := false
+	initr.stage = func() {
+		staged = true
+		// the scan completes a few polls after the login
+		time.AfterFunc(3*sessionPollInterval, func() {
+			_ = os.MkdirAll(filepath.Join(blockDir, "sdx"), 0o755)
+		})
+		if err := fm.Mount(iscsiDev, staging, "xfs", []string{"rw"}); err != nil {
+			t.Errorf("fake stage mount failed: %v", err)
+		}
+	}
+	origSrc := stagingMountSource
+	stagingMountSource = func(path string) (string, bool) {
+		if path != staging {
+			return "", false
+		}
+		if staged {
+			return iscsiDev, true
+		}
+		return "", false
+	}
+	t.Cleanup(func() { stagingMountSource = origSrc })
+
+	if _, err := selfHealNode(fm, initr).NodePublishVolume(context.Background(), iscsiMountPublishRequest(staging, target)); err != nil {
+		t.Fatalf("publish must ride out the asynchronous scan, got: %v", err)
+	}
+	assertBind(t, fm, staging, target)
+}
+
+// When the sysfs session already carries the lun, the by-path wait is dead
+// time -- infinite on udev-less nodes. loginTarget must probe sysfs first,
+// and keep the by-path in its leg list either way: the leg count drives the
+// multipath decision and the path stays the stage's fallback.
+func TestLoginTargetKeepsTheByPathWhenSysfsAnswers(t *testing.T) {
+	withAbsentByPath(t) // the wait, if reached, fails instantly
+	withFakeSysfs(t, pvcIqn)
+	ns := &nodeServer{
+		dsmService: liveDsm{},
+		Initiator:  &fakeInitiator{},
+		tools:      tools{executor: &recordingExecutor{}},
+	}
+	paths, iqn, lun, err := ns.loginTarget("8029e1d2-8ea8-4e8a-ae5f-e4b9404885fa")
+	if err != nil {
+		t.Fatalf("loginTarget must succeed when sysfs already answers, got: %v", err)
+	}
+	if iqn != pvcIqn || lun != 1 {
+		t.Fatalf("expected target[%s] lun 1, got %q/%d", pvcIqn, iqn, lun)
+	}
+	if len(paths) != 1 || !strings.Contains(paths[0], "/dev/disk/by-path/") {
+		t.Fatalf("the by-path link must stay in the leg list (multipath counting, stage fallback), got: %v", paths)
 	}
 }

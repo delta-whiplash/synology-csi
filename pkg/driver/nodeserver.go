@@ -322,16 +322,18 @@ func (ns *nodeServer) loginTarget(volumeId string) (paths []string, iqn string, 
 		}
 
 		path := fmt.Sprintf("%sip-%s-iscsi-%s-lun-%d", "/dev/disk/by-path/", portal, iqn, lun)
-		if err := waitForDevicePathToExist(path); err != nil {
-			// The by-path links are udev's work: on udev-less nodes (Talos)
-			// they never appear although the login and the rescan succeeded.
-			// stageIscsiAt discovers the device from sysfs instead and only
-			// falls back to these links, so their absence is not a failed
-			// stage -- skip them and keep the login.
-			log.Warnf("Can't find device path [%s]: %v", path, err)
-			continue
+		// The sysfs session answers as soon as the kernel has attached the
+		// lun, while the by-path links wait for udev -- and never come at all
+		// on udev-less nodes (Talos). Probe sysfs first: when it already sees
+		// the lun, the by-path wait is dead time. The link is appended either
+		// way -- its leg count drives the multipath decision and it remains
+		// the stage's by-path fallback.
+		if _, findErr := findSessionDevice(iqn, lun, sysfsRoot); findErr != nil {
+			if err := waitForDevicePathToExist(path); err != nil {
+				log.Warnf("Can't find device path [%s]: %v", path, err)
+				continue
+			}
 		}
-
 		paths = append(paths, path)
 	}
 

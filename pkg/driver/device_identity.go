@@ -28,9 +28,26 @@ var devDir = "/dev"
 var sessionPollInterval = time.Second
 
 // waitForSessionDevice returns the block device the kernel attached to
-// (iqn, lun), resolved from sysfs. Var so tests can stand the walk in.
+// (iqn, lun), resolved from sysfs. The kernel scans a freshly logged-in
+// session asynchronously, so the first read legitimately misses -- the walk
+// is retried on a bounded budget, like the by-path wait it mirrors. Only the
+// transient classifications are retried; an unreadable layout comes back at
+// once. Var so tests can stand the walk in.
 var waitForSessionDevice = func(iqn string, lun int, sysfs string) (string, error) {
-	return findSessionDevice(iqn, lun, sysfs)
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		dev, err := findSessionDevice(iqn, lun, sysfs)
+		if err == nil {
+			return dev, nil
+		}
+		if !errors.Is(err, ErrSessionNotFound) && !errors.Is(err, ErrLunNotFound) {
+			return "", err
+		}
+		if time.Now().After(deadline) {
+			return "", err
+		}
+		time.Sleep(sessionPollInterval)
+	}
 }
 
 var sessionRe = regexp.MustCompile(`(^|/)(session\d+)(/|$)`)
