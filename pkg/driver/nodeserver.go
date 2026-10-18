@@ -18,6 +18,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -293,8 +294,27 @@ func (ns *nodeServer) loginTarget(volumeId string) (paths []string, iqn string, 
 	lun = k8sVolume.Target.MappedLuns[0].MappingIndex
 	for _, portal := range portals {
 		if err := ns.Initiator.login(iqn, portal); err != nil {
-			return nil, "", 0, status.Errorf(codes.Internal,
-				fmt.Sprintf("Failed to login with target iqn [%s], err: %v", iqn, err))
+			// Synology maps one session per LUN target: a stale LOCAL session
+			// (left by a crashed pod cycle) blocks every re-login. Log this
+			// node's session out and try once more -- remote sessions are not
+			// ours to touch.
+			log.Warnf("Login with target iqn [%s] failed, logging out stale local session and retrying once", iqn)
+			_ = ns.tools.iscsiadm_logout(iqn)
+			if err := ns.Initiator.login(iqn, portal); err != nil {
+				return nil, "", 0, status.Errorf(codes.Internal,
+					fmt.Sprintf("Failed to login with target iqn [%s], err: %v", iqn, err))
+			}
+		}
+
+		// Without udev (Talos) nothing scans a freshly logged-in session: the
+		// device nodes only appear after an explicit rescan (same step as
+		// csi-lib-iscsi's Connect). Rescan every session of this target.
+		for _, session := range ns.tools.iscsiadm_session() {
+			if session.Iqn == iqn {
+				if err := ns.tools.iscsiadm_rescan_session(fmt.Sprint(session.Id)); err != nil {
+					log.Warnf("Failed to rescan session [%d]: %v", session.Id, err)
+				}
+			}
 		}
 
 		path := fmt.Sprintf("%sip-%s-iscsi-%s-lun-%d", "/dev/disk/by-path/", portal, iqn, lun)
@@ -457,7 +477,7 @@ func (ns *nodeServer) setNFSVolumePrivilege(sourcePath string, hostnames []strin
 			Crossmnt:   true,
 			Insecure:   true,
 			Privilege:  string(authType),
-			RootSquash: "root",
+			RootSquash: nfsRootSquashValue(),
 			SecurityFlavor: webapi.SecurityFlavor{
 				Kerbros:          false,
 				KerbrosIntegrity: false,
@@ -596,7 +616,10 @@ func (ns *nodeServer) nodeStageISCSIVolume(ctx context.Context, spec *models.Nod
 		return nil, status.Error(codes.Internal, "Can't get volume mount path")
 	}
 
-	if err := verifyIscsiDevice(volumeMountPath, iqn, lun, sysfsRoot); err != nil {
+	// Mount the resolved device, not the link: a by-path link repointed after
+	// the verification would otherwise still be followed by mount(2).
+	volumeMountPath, err = verifyIscsiDevice(volumeMountPath, iqn, lun, sysfsRoot)
+	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
@@ -950,6 +973,38 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 	default:
+		// A filesystem volume is guaranteed staged -- and its LUN identity
+		// verified -- before publish: bind the staging path and stop there.
+		// Re-logging-in at publish time raced /dev/disk/by-* creation on
+		// systems where those links lag behind the login, and has handed pods
+		// the node's own partition. Only raw-block volumes skip staging and
+		// need a device path here.
+		if !isBlock {
+			if mounted, err := isStillMounted(ns.Mounter.Interface, stagingTargetPath); err != nil {
+				return nil, status.Error(codes.Internal, err.Error())
+			} else if !mounted {
+				// Bind-staging contract: publishing over an unstaged directory
+				// would give the pod a silently empty filesystem.
+				return nil, status.Error(codes.FailedPrecondition,
+					"staging target is not mounted: stage must complete before publish")
+			}
+			// The kubelet can skip staging when its cached state says "already
+			// staged", leaving whatever the staging path held at reconstruction
+			// time -- observed in production as a pod living on the node's own
+			// partition. Verify the backing device is an iSCSI whole disk.
+			if dev, ok := stagingMountSource(stagingTargetPath); !ok || dev == "" {
+				return nil, status.Error(codes.FailedPrecondition,
+					"staging target has no backing device in the mount table")
+			} else if err := requireIscsiDisk(dev, sysfsRoot); err != nil {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"staging target is not backed by a verified iSCSI disk: %v", err)
+			}
+			if err := ns.Mounter.Interface.Mount(stagingTargetPath, targetPath, fsType, options); err != nil {
+				return nil, status.Error(codes.Internal, err.Error())
+			}
+			return &csi.NodePublishVolumeResponse{}, nil
+		}
+
 		iscsiDevPaths, iqn, lun, err := ns.loginTarget(volumeId)
 		if err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
@@ -960,22 +1015,63 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			return nil, status.Error(codes.Internal, "Can't get volume mount path")
 		}
 
-		if err := verifyIscsiDevice(volumeMountPath, iqn, lun, sysfsRoot); err != nil {
+		// Mount the resolved device, not the link (same rationale as stage).
+		volumeMountPath, err = verifyIscsiDevice(volumeMountPath, iqn, lun, sysfsRoot)
+		if err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 
-		if isBlock {
-			err = ns.Mounter.Interface.Mount(volumeMountPath, targetPath, "", options)
-		} else {
-			err = ns.Mounter.Interface.Mount(stagingTargetPath, targetPath, fsType, options)
-		}
-		if err != nil {
+		if err := ns.Mounter.Interface.Mount(volumeMountPath, targetPath, "", options); err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 	}
 
 	return &csi.NodePublishVolumeResponse{}, nil
 }
+
+// isStillMounted reports whether path carries a live mount right now. The
+// "likely" fast check cannot see bind mounts of plain directories, so the
+// authoritative /proc/mounts table decides. Var so tests can point it at a
+// fake mount table.
+var isStillMounted = func(mounter mount.Interface, path string) (bool, error) {
+	// The kernel records the resolved dentry path: a mount made through a
+	// symlinked component only matches here once the path is resolved too.
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		path = real
+	}
+	mounts, err := mount.ListProcMounts("/proc/mounts")
+	if err != nil {
+		return false, err
+	}
+	for _, mp := range mounts {
+		if mp.Path == path {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// stagingMountSource returns the device backing a mounted staging path, per
+// the authoritative mount table. Var so tests can point it at a fake table.
+var stagingMountSource = func(path string) (string, bool) {
+	mounts, err := mount.ListProcMounts("/proc/mounts")
+	if err != nil {
+		return "", false
+	}
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		path = real
+	}
+	for _, mp := range mounts {
+		if mp.Path == path {
+			return mp.Device, true
+		}
+	}
+	return "", false
+}
+
+// maxUnmountPeels bounds the stacked-bind teardown of one call; kubelet
+// retries NodeUnpublishVolume if layers remain.
+const maxUnmountPeels = 10
 
 func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 	if req.GetVolumeId() == "" { // Not needed, but still a mandatory field
@@ -991,25 +1087,42 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 		if os.IsNotExist(err) {
 			return &csi.NodeUnpublishVolumeResponse{}, nil
 		}
-		return nil, status.Errorf(codes.Internal, err.Error())
+		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 
-	notMount, err := mount.IsNotMountPoint(ns.Mounter.Interface, targetPath)
-
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+	// The "likely" fast check cannot see bind mounts of plain directories, and
+	// reporting success on a mount that is still alive is how a migration left
+	// iSCSI sessions logged in forever: kubelet retries unpublish, never
+	// reaches unstage, and the next attach is refused Multi-Attach. Peel the
+	// layers against the authoritative mount table instead.
+	for i := 0; i < maxUnmountPeels; i++ {
+		mounted, err := isStillMounted(ns.Mounter.Interface, targetPath)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "Couldn't check whether %s is mounted: %v", targetPath, err)
+		}
+		if !mounted {
+			break
+		}
+		if err := ns.Mounter.Interface.Unmount(targetPath); err != nil {
+			return nil, status.Errorf(codes.Internal, "Failed to unmount %s: %v", targetPath, err)
+		}
 	}
 
-	if notMount {
-		return &csi.NodeUnpublishVolumeResponse{}, nil
+	if mounted, err := isStillMounted(ns.Mounter.Interface, targetPath); err != nil {
+		return nil, status.Errorf(codes.Internal, "Couldn't check whether %s is mounted: %v", targetPath, err)
+	} else if mounted {
+		return nil, status.Errorf(codes.Internal, "%s is still mounted after %d unmount attempts", targetPath, maxUnmountPeels)
 	}
 
-	if err := ns.Mounter.Interface.Unmount(targetPath); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-
-	if err := os.Remove(targetPath); err != nil {
-		return nil, status.Errorf(codes.Internal, "Failed to remove target path.")
+	if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+		if errors.Is(err, unix.ENOTEMPTY) || errors.Is(err, unix.EEXIST) {
+			// The mount is verifiably gone; whatever sits in the directory is
+			// leftover content for the kubelet's pod-dir GC, not a reason to
+			// wedge this pod's deletion forever.
+			log.Infof("NodeUnpublishVolume: %s still has leftover content, leaving it to kubelet GC", targetPath)
+			return &csi.NodeUnpublishVolumeResponse{}, nil
+		}
+		return nil, status.Errorf(codes.Internal, "Failed to remove target path: %v", err)
 	}
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
@@ -1102,7 +1215,7 @@ func (ns *nodeServer) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVo
 
 func (ns *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
 	volumeId, volumePath := req.GetVolumeId(), req.GetVolumePath()
-	sizeInByte, err := getSizeByCapacityRange(req.GetCapacityRange())
+	sizeInByte, err := getSizeByCapacityRange(req.GetCapacityRange(), 0)
 	if volumeId == "" || volumePath == "" {
 		return nil, status.Error(codes.InvalidArgument, "InvalidArgument: Please check volume ID and volume path.")
 	}
