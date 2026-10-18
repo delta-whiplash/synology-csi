@@ -294,8 +294,27 @@ func (ns *nodeServer) loginTarget(volumeId string) (paths []string, iqn string, 
 	lun = k8sVolume.Target.MappedLuns[0].MappingIndex
 	for _, portal := range portals {
 		if err := ns.Initiator.login(iqn, portal); err != nil {
-			return nil, "", 0, status.Errorf(codes.Internal,
-				fmt.Sprintf("Failed to login with target iqn [%s], err: %v", iqn, err))
+			// Synology maps one session per LUN target: a stale LOCAL session
+			// (left by a crashed pod cycle) blocks every re-login. Log this
+			// node's session out and try once more -- remote sessions are not
+			// ours to touch.
+			log.Warnf("Login with target iqn [%s] failed, logging out stale local session and retrying once", iqn)
+			_ = ns.tools.iscsiadm_logout(iqn)
+			if err := ns.Initiator.login(iqn, portal); err != nil {
+				return nil, "", 0, status.Errorf(codes.Internal,
+					fmt.Sprintf("Failed to login with target iqn [%s], err: %v", iqn, err))
+			}
+		}
+
+		// Without udev (Talos) nothing scans a freshly logged-in session: the
+		// device nodes only appear after an explicit rescan (same step as
+		// csi-lib-iscsi's Connect). Rescan every session of this target.
+		for _, session := range ns.tools.iscsiadm_session() {
+			if session.Iqn == iqn {
+				if err := ns.tools.iscsiadm_rescan_session(fmt.Sprint(session.Id)); err != nil {
+					log.Warnf("Failed to rescan session [%d]: %v", session.Id, err)
+				}
+			}
 		}
 
 		path := fmt.Sprintf("%sip-%s-iscsi-%s-lun-%d", "/dev/disk/by-path/", portal, iqn, lun)

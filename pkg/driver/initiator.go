@@ -162,6 +162,18 @@ func (t *tools) iscsiadm_update_node_startup(iqn, portal string) error {
 	return nil
 }
 
+// iscsiadm_rescan_session asks the kernel to re-scan one session: on systems
+// without udev (Talos) a freshly logged-in LUN never materialises a device
+// node on its own -- nothing scans it -- so by-path links stay absent and
+// every downstream path wait times out.
+func (t *tools) iscsiadm_rescan_session(sid string) error {
+	cmd := t.iscsiadm("-m", "session", "-r", sid, "--rescan")
+	if _, err := cmd.CombinedOutput(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (t *tools) iscsiadm_logout(iqn string) error {
 	cmd := t.iscsiadm(
 		"-m", "node",
