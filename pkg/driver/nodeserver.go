@@ -624,6 +624,32 @@ func (ns *nodeServer) nodeStageISCSIVolume(ctx context.Context, spec *models.Nod
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
+// resolveStageDevice picks the block device a stage mounts. Several by-path
+// legs mean multipath: the device to mount is the dm map spanning the legs --
+// the sysfs walk only ever sees one leg and would silently drop the
+// redundancy -- so getVolumeMountPath decides and there is no single-leg
+// fallback. Mono-path, the sysfs session walk leads (udev-less nodes never
+// grow by-path links) and by-path stays as the fallback.
+func resolveStageDevice(iscsiDevPaths []string, iqn string, lun int) (string, error) {
+	if len(iscsiDevPaths) > 1 {
+		volumeMountPath := getVolumeMountPath(iscsiDevPaths)
+		if volumeMountPath == "" {
+			return "", fmt.Errorf("can't resolve the multipath device of target[%s] lun %d -- refusing to mount a single leg", iqn, lun)
+		}
+		return volumeMountPath, nil
+	}
+
+	volumeMountPath, err := waitForSessionDevice(iqn, lun, sysfsRoot)
+	if err != nil {
+		log.Warnf("sysfs discovery of target[%s] lun %d failed (%v), falling back to the by-path links", iqn, lun, err)
+		volumeMountPath = getVolumeMountPath(iscsiDevPaths)
+		if volumeMountPath == "" {
+			return "", fmt.Errorf("can't resolve the block device of target[%s] lun %d: %v", iqn, lun, err)
+		}
+	}
+	return volumeMountPath, nil
+}
+
 // stageIscsiAt logs the volume's LUN in and mounts it at stagingTargetPath --
 // the whole staging sequence, shared by NodeStageVolume and by the publish
 // self-heal, which rebuilds a staging path whose "staged" state the kubelet
@@ -635,17 +661,9 @@ func (ns *nodeServer) stageIscsiAt(stagingTargetPath, volumeId string, mountVolu
 		return err
 	}
 
-	// Primary source: the kernel's own view of the session. udev-less nodes
-	// (Talos) never create the /dev/disk/by-path links, so discovery has to
-	// start from the session the kernel actually recorded; the by-path links
-	// stay as the fallback for the nodes that do have them.
-	volumeMountPath, findErr := waitForSessionDevice(iqn, lun, sysfsRoot)
-	if findErr != nil {
-		log.Warnf("sysfs discovery of target[%s] lun %d failed (%v), falling back to the by-path links", iqn, lun, findErr)
-		volumeMountPath = getVolumeMountPath(iscsiDevPaths)
-		if volumeMountPath == "" {
-			return fmt.Errorf("can't resolve the block device of target[%s] lun %d: %v", iqn, lun, findErr)
-		}
+	volumeMountPath, err := resolveStageDevice(iscsiDevPaths, iqn, lun)
+	if err != nil {
+		return err
 	}
 
 	// Mount the resolved device, not the link: a by-path link repointed after
@@ -668,6 +686,10 @@ func (ns *nodeServer) stageIscsiAt(stagingTargetPath, volumeId string, mountVolu
 	options := append([]string{"rw"}, mountVolume.GetMountFlags()...)
 	options = withXfsMountOptions(fsType, options)
 
+	// formatOptions are the stage's mkfs options; the publish self-heal
+	// passes none -- a NodePublishVolumeRequest carries no format options,
+	// and a staging being rebuilt is formatted with the defaults (in
+	// practice the LUN already carries a filesystem).
 	if err := ns.Mounter.FormatAndMountSensitiveWithFormatOptions(volumeMountPath, stagingTargetPath, fsType, options, nil, formatOptions); err != nil {
 		return err
 	}

@@ -686,3 +686,32 @@ func TestLoginTargetKeepsTheByPathWhenSysfsAnswers(t *testing.T) {
 		t.Fatalf("the by-path link must stay in the leg list (multipath counting, stage fallback), got: %v", paths)
 	}
 }
+
+// Several by-path legs mean multipath: the stage must mount the dm map that
+// spans the legs -- the sysfs walk only ever sees one leg and would silently
+// drop the redundancy. When the map cannot be resolved, the stage fails; it
+// must never quietly mount a single leg instead.
+func TestResolveStageDeviceRefusesASingleLegWhenMultipathIsExpected(t *testing.T) {
+	withFakeSysfs(t, pvcIqn) // a leg IS resolvable from sysfs -- and must not be used
+	if _, err := resolveStageDevice(
+		[]string{
+			"/dev/disk/by-path/ip-10.10.146.6:3260-iscsi-iqn.2000-01.com.synology:test.pvc-1-lun-1",
+			"/dev/disk/by-path/ip-10.10.146.7:3260-iscsi-iqn.2000-01.com.synology:test.pvc-1-lun-1",
+		},
+		pvcIqn, 1); err == nil {
+		t.Fatal("an unresolvable multipath map must fail the stage, not fall back to a single leg")
+	}
+}
+
+// Mono-path keeps the sysfs walk as the primary source: udev-less nodes have
+// no by-path links at all.
+func TestResolveStageDeviceWalksSysfsOnMonoPath(t *testing.T) {
+	_, dev := withFakeSysfs(t, pvcIqn) // under the seam, devDir is the fake tree
+	got, err := resolveStageDevice(nil, pvcIqn, 1)
+	if err != nil {
+		t.Fatalf("the sysfs walk must resolve the mono-path device, got: %v", err)
+	}
+	if got != dev {
+		t.Errorf("expected the walked device %s, got %q", dev, got)
+	}
+}
