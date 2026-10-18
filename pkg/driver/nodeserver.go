@@ -969,6 +969,17 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 				return nil, status.Error(codes.FailedPrecondition,
 					"staging target is not mounted: stage must complete before publish")
 			}
+			// The kubelet can skip staging when its cached state says "already
+			// staged", leaving whatever the staging path held at reconstruction
+			// time -- observed in production as a pod living on the node's own
+			// partition. Verify the backing device is an iSCSI whole disk.
+			if dev, ok := stagingMountSource(stagingTargetPath); !ok || dev == "" {
+				return nil, status.Error(codes.FailedPrecondition,
+					"staging target has no backing device in the mount table")
+			} else if err := requireIscsiDisk(dev, sysfsRoot); err != nil {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"staging target is not backed by a verified iSCSI disk: %v", err)
+			}
 			if err := ns.Mounter.Interface.Mount(stagingTargetPath, targetPath, fsType, options); err != nil {
 				return nil, status.Error(codes.Internal, err.Error())
 			}
@@ -1019,6 +1030,24 @@ var isStillMounted = func(mounter mount.Interface, path string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// stagingMountSource returns the device backing a mounted staging path, per
+// the authoritative mount table. Var so tests can point it at a fake table.
+var stagingMountSource = func(path string) (string, bool) {
+	mounts, err := mount.ListProcMounts("/proc/mounts")
+	if err != nil {
+		return "", false
+	}
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		path = real
+	}
+	for _, mp := range mounts {
+		if mp.Path == path {
+			return mp.Device, true
+		}
+	}
+	return "", false
 }
 
 // maxUnmountPeels bounds the stacked-bind teardown of one call; kubelet

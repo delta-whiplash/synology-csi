@@ -109,3 +109,38 @@ func verifyIscsiDevice(devPath, wantIqn string, wantLun int, sysfs string) (stri
 	}
 	return real, nil
 }
+
+// requireIscsiDisk checks that devPath is backed by an iSCSI whole disk as the
+// kernel sees it, without target matching -- publish carries no DSM context.
+// It is the last line of defense against a staging mount whose backing device
+// is the node's own disk: the kubelet can skip NodeStageVolume when its cached
+// state says "already staged", and bind whatever the staging path holds.
+func requireIscsiDisk(devPath, sysfs string) error {
+	real, err := filepath.EvalSymlinks(devPath)
+	if err != nil {
+		return fmt.Errorf("device %s does not resolve: %v", devPath, err)
+	}
+	names := []string{filepath.Base(real)}
+	if strings.HasPrefix(names[0], "dm-") {
+		slaves, err := os.ReadDir(filepath.Join(sysfs, "block", names[0], "slaves"))
+		if err != nil || len(slaves) == 0 {
+			return fmt.Errorf("multipath device %s has no verifiable slaves", real)
+		}
+		names = names[:0]
+		for _, s := range slaves {
+			names = append(names, s.Name())
+		}
+	}
+	for _, name := range names {
+		canonical, err := filepath.EvalSymlinks(filepath.Join(sysfs, "block", name, "device"))
+		if err != nil {
+			return fmt.Errorf("no kernel device for %s (%s): %v -- refusing a staging "+
+				"mount not backed by an iSCSI disk", devPath, name, err)
+		}
+		if sessionRe.FindStringSubmatch(canonical) == nil {
+			return fmt.Errorf("%s (%s) is not an iSCSI disk (sysfs path %s) -- refusing "+
+				"the staging mount", devPath, name, canonical)
+		}
+	}
+	return nil
+}

@@ -49,6 +49,19 @@ func iscsiMountPublishRequest(staging, target string) *csi.NodePublishVolumeRequ
 // been observed handing a pod the node's local partition.
 func TestPublishBindsStagingWithoutTouchingDsm(t *testing.T) {
 	withFakeMountDetection(t)
+	// un staging backing device qui passe requireIscsiDisk (faux sysfs)
+	sysfs, iscsiDev := fakeSysfs(t, "sdx", "session7", "6:0:0:1", rightIqn)
+	oldSys := sysfsRoot
+	sysfsRoot = sysfs
+	t.Cleanup(func() { sysfsRoot = oldSys })
+	origSrc := stagingMountSource
+	stagingMountSource = func(path string) (string, bool) {
+		if path == filepath.Join(t.TempDir(), "never") {
+			return "", false
+		}
+		return iscsiDev, true
+	}
+	t.Cleanup(func() { stagingMountSource = origSrc })
 	base := t.TempDir()
 	staging := filepath.Join(base, "staging")
 	target := filepath.Join(base, "target")
@@ -267,5 +280,40 @@ func TestUnpublishToleratesLeftoverDirectoryContent(t *testing.T) {
 		TargetPath: target,
 	}); err != nil {
 		t.Fatalf("unpublish must succeed once the mount is verified gone, got: %v", err)
+	}
+}
+
+// The kubelet can skip NodeStageVolume entirely when its cached state says
+// "already staged" (reconstructed from a stale globalmount), and then bind
+// whatever the staging path holds -- a node-local partition, or nothing. The
+// publish is the last line of defense: it must verify that the staging mount
+// is backed by an iSCSI whole disk before handing it to a pod.
+func TestPublishRefusesNonIscsiBackingDevice(t *testing.T) {
+	withFakeMountDetection(t)
+	base := t.TempDir()
+	staging, target := filepath.Join(base, "staging"), filepath.Join(base, "target")
+	for _, d := range []string{staging, target} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// staging IS mounted... but by the node's local partition (the 2026-10-17
+	// incident: the pod received /dev/sda4)
+	fm := mount.NewFakeMounter([]mount.MountPoint{{Device: "/dev/sda4", Path: staging}})
+	ns := &nodeServer{
+		Mounter:    &mount.SafeFormatAndMount{Interface: fm},
+		dsmService: failingDsm{},
+	}
+	orig := stagingMountSource
+	stagingMountSource = func(path string) (string, bool) {
+		if path == staging {
+			return "/dev/sda4", true
+		}
+		return "", false
+	}
+	t.Cleanup(func() { stagingMountSource = orig })
+
+	if _, err := ns.NodePublishVolume(context.Background(), iscsiMountPublishRequest(staging, target)); err == nil {
+		t.Fatal("publish must refuse a staging mount backed by a non-iSCSI device")
 	}
 }
