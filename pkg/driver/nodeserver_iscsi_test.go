@@ -14,6 +14,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"k8s.io/mount-utils"
 
+	"github.com/SynologyOpenSource/synology-csi/pkg/dsm/webapi"
 	"github.com/SynologyOpenSource/synology-csi/pkg/interfaces"
 	"github.com/SynologyOpenSource/synology-csi/pkg/models"
 	"github.com/SynologyOpenSource/synology-csi/pkg/utils"
@@ -315,5 +316,287 @@ func TestPublishRefusesNonIscsiBackingDevice(t *testing.T) {
 
 	if _, err := ns.NodePublishVolume(context.Background(), iscsiMountPublishRequest(staging, target)); err == nil {
 		t.Fatal("publish must refuse a staging mount backed by a non-iSCSI device")
+	}
+}
+
+const pvcIqn = "iqn.2000-01.com.synology:test.pvc-1"
+
+// liveDsm answers the two lookups the self-heal needs: the volume's iSCSI
+// target identity and the DSM record behind its portal. Rebuilding a staging
+// re-resolves the volume through DSM -- unlike the fast path, which must
+// never call DSM at all (failingDsm pins that).
+type liveDsm struct {
+	interfaces.IDsmService
+}
+
+func (liveDsm) GetVolume(string) (*models.K8sVolumeRespSpec, error) {
+	return &models.K8sVolumeRespSpec{
+		VolumeId: "8029e1d2-8ea8-4e8a-ae5f-e4b9404885fa",
+		DsmIp:    "10.10.146.6",
+		Target: webapi.TargetInfo{
+			Iqn:        pvcIqn,
+			MappedLuns: []webapi.MappedLun{{LunUuid: "lun-pvc-1", MappingIndex: 1}},
+		},
+	}, nil
+}
+
+func (liveDsm) GetDsm(string) (*webapi.DSM, error) {
+	return &webapi.DSM{}, nil
+}
+
+// fakeInitiator stands in for the host's iSCSI initiator: it counts logins
+// (the fast path must make none) and can fail them (AC4) or, on success, lay
+// the staged mount into the fake mount table -- a stand-in for the real
+// FormatAndMount that follows a login in production, folded into the login
+// because that is the step whose success makes a stage possible.
+type fakeInitiator struct {
+	logins   int
+	loginErr error
+	// stage, when set, runs inside a successful login: that is where the test
+	// simulates the mount the real stage would perform.
+	stage func()
+}
+
+func (f *fakeInitiator) login(iqn, portal string) error {
+	f.logins++
+	if f.loginErr != nil {
+		return f.loginErr
+	}
+	if f.stage != nil {
+		f.stage()
+	}
+	return nil
+}
+
+func (f *fakeInitiator) logout(string, string) error { return nil }
+func (f *fakeInitiator) rescan(string) error         { return nil }
+
+// withAbsentByPath points the by-path wait at a node with no /dev/disk at
+// all -- the udev-less Talos shape the self-heal exists for: the login and
+// the rescan succeed, udev never builds the links. Without this seam every
+// self-heal test would wait out the real 20-second poll.
+func withAbsentByPath(t *testing.T) {
+	t.Helper()
+	orig := waitForDevicePathToExist
+	waitForDevicePathToExist = func(string) error {
+		return errors.New("no /dev/disk/by-path on this fake node")
+	}
+	t.Cleanup(func() { waitForDevicePathToExist = orig })
+}
+
+// withFakeSysfs points sysfsRoot and devDir at a fabricated sysfs holding one
+// logged-in iSCSI session for iqn (lun 1): the discovery walk reads the
+// session there and resolves the /dev/<name> node inside the same tree, the
+// way kernel sysfs and /dev agree on a real node. Returns the fake device
+// path the walk hands out.
+func withFakeSysfs(t *testing.T, iqn string) (sysfs, dev string) {
+	t.Helper()
+	sysfs, dev = fakeSysfs(t, "sdx", "session7", "6:0:0:1", iqn)
+	oldSys, oldDev := sysfsRoot, devDir
+	sysfsRoot, devDir = sysfs, sysfs
+	t.Cleanup(func() { sysfsRoot, devDir = oldSys, oldDev })
+	return sysfs, dev
+}
+
+// selfHealNode wires a node server for the self-heal tests: a DSM that
+// answers, a counting initiator, and a host executor reporting no iscsiadm
+// sessions (nothing to rescan after the fake login).
+func selfHealNode(fm *mount.FakeMounter, initr *fakeInitiator) *nodeServer {
+	return &nodeServer{
+		Mounter:    &mount.SafeFormatAndMount{Interface: fm},
+		dsmService: liveDsm{},
+		Initiator:  initr,
+		tools:      tools{executor: &recordingExecutor{}},
+	}
+}
+
+// assertBind checks that the publish bound the staging path onto the target.
+func assertBind(t *testing.T, fm *mount.FakeMounter, staging, target string) {
+	t.Helper()
+	for _, mp := range fm.MountPoints {
+		if mp.Path == target && utils.SliceContains(mp.Opts, "bind") {
+			return
+		}
+	}
+	t.Fatalf("publish did not bind staging %s onto %s; mounted: %v", staging, target, fm.MountPoints)
+}
+
+// AC1: the kubelet's cached state said "staged" but the staging path holds no
+// mount at all (node rebuilt under it). Publish used to refuse with
+// FailedPrecondition and the pod stayed wedged forever; it must now resolve
+// the volume through DSM, log the target in, stage the LUN at the staging
+// path and bind it -- all of it through the sysfs walk, since this node has
+// no by-path links.
+func TestPublishSelfHealsAnUnstagedStaging(t *testing.T) {
+	withFakeMountDetection(t)
+	withAbsentByPath(t)
+	_, iscsiDev := withFakeSysfs(t, pvcIqn)
+
+	base := t.TempDir()
+	staging, target := filepath.Join(base, "staging"), filepath.Join(base, "target")
+	for _, d := range []string{staging, target} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fm := mount.NewFakeMounter(nil)
+	initr := &fakeInitiator{}
+	// the login succeeding is what makes a stage possible: from that point on
+	// the staging path carries the LUN, and the mount table says so.
+	staged := false
+	initr.stage = func() {
+		staged = true
+		if err := fm.Mount(iscsiDev, staging, "xfs", []string{"rw"}); err != nil {
+			t.Errorf("fake stage mount failed: %v", err)
+		}
+	}
+	origSrc := stagingMountSource
+	stagingMountSource = func(path string) (string, bool) {
+		if path != staging {
+			return "", false
+		}
+		if staged {
+			return iscsiDev, true
+		}
+		return "/dev/sda4", true
+	}
+	t.Cleanup(func() { stagingMountSource = origSrc })
+
+	if _, err := selfHealNode(fm, initr).NodePublishVolume(context.Background(), iscsiMountPublishRequest(staging, target)); err != nil {
+		t.Fatalf("publish must self-heal an unstaged staging, got: %v", err)
+	}
+	assertBind(t, fm, staging, target)
+}
+
+// AC2: the kubelet believed the volume staged, but the staging path is
+// mounted from the node's own partition (the 2026-10-17 incident). Publish
+// must tear that mount down, re-run the full stage against the volume's LUN,
+// re-verify what the staging now holds and only then bind.
+func TestPublishSelfHealsAStagingBackedByAnotherDisk(t *testing.T) {
+	withFakeMountDetection(t)
+	withAbsentByPath(t)
+	_, iscsiDev := withFakeSysfs(t, pvcIqn)
+
+	base := t.TempDir()
+	staging, target := filepath.Join(base, "staging"), filepath.Join(base, "target")
+	for _, d := range []string{staging, target} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// the staging IS mounted -- by the node's local partition
+	fm := mount.NewFakeMounter([]mount.MountPoint{{Device: "/dev/sda4", Path: staging}})
+	initr := &fakeInitiator{}
+	staged := false
+	initr.stage = func() {
+		staged = true
+		if err := fm.Mount(iscsiDev, staging, "xfs", []string{"rw"}); err != nil {
+			t.Errorf("fake stage mount failed: %v", err)
+		}
+	}
+	origSrc := stagingMountSource
+	stagingMountSource = func(path string) (string, bool) {
+		if path != staging {
+			return "", false
+		}
+		if staged {
+			return iscsiDev, true
+		}
+		return "/dev/sda4", true
+	}
+	t.Cleanup(func() { stagingMountSource = origSrc })
+
+	if _, err := selfHealNode(fm, initr).NodePublishVolume(context.Background(), iscsiMountPublishRequest(staging, target)); err != nil {
+		t.Fatalf("publish must replace a staging backed by another disk, got: %v", err)
+	}
+
+	// the final stack: the LUN mounted at staging (the rebuilt stage) and the
+	// bind of staging onto the target, with no trace of the partition.
+	bound, restaged := false, false
+	for _, mp := range fm.MountPoints {
+		if mp.Path == target && utils.SliceContains(mp.Opts, "bind") {
+			bound = true
+		}
+		if mp.Path == staging && mp.Device == iscsiDev {
+			restaged = true
+		}
+		if mp.Device == "/dev/sda4" {
+			t.Fatalf("the stale partition mount must be gone, final stack: %v", fm.MountPoints)
+		}
+	}
+	if !bound || !restaged {
+		t.Fatalf("expected the LUN re-staged at %s and bound onto %s; mounted: %v", staging, target, fm.MountPoints)
+	}
+}
+
+// AC3: the staging path already holds a verified iSCSI disk -- the fast
+// path. Binding must be the whole story: zero logins, zero DSM.
+func TestPublishBindsAVerifiedStagingWithoutAnyLogin(t *testing.T) {
+	withFakeMountDetection(t)
+	_, iscsiDev := withFakeSysfs(t, pvcIqn)
+
+	base := t.TempDir()
+	staging, target := filepath.Join(base, "staging"), filepath.Join(base, "target")
+	for _, d := range []string{staging, target} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fm := mount.NewFakeMounter([]mount.MountPoint{{Device: iscsiDev, Path: staging}})
+	origSrc := stagingMountSource
+	stagingMountSource = func(path string) (string, bool) {
+		if path == staging {
+			return iscsiDev, true
+		}
+		return "", false
+	}
+	t.Cleanup(func() { stagingMountSource = origSrc })
+
+	initr := &fakeInitiator{}
+	ns := &nodeServer{
+		Mounter:    &mount.SafeFormatAndMount{Interface: fm},
+		dsmService: failingDsm{},
+		Initiator:  initr,
+	}
+	if _, err := ns.NodePublishVolume(context.Background(), iscsiMountPublishRequest(staging, target)); err != nil {
+		t.Fatalf("publish must bind a verified staging as-is, got: %v", err)
+	}
+	if initr.logins != 0 {
+		t.Fatalf("the fast path must not log in, got %d login(s)", initr.logins)
+	}
+	assertBind(t, fm, staging, target)
+}
+
+// AC4: the self-heal needs a login and the login fails (portal down). The
+// publish must surface the failure and bind nothing -- but it must have
+// TRIED the login, which is what separates this from the old refusal.
+func TestPublishReportsAFailedSelfHealLoginAndBindsNothing(t *testing.T) {
+	withFakeMountDetection(t)
+	withFakeSysfs(t, pvcIqn)
+
+	base := t.TempDir()
+	staging, target := filepath.Join(base, "staging"), filepath.Join(base, "target")
+	for _, d := range []string{staging, target} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fm := mount.NewFakeMounter(nil)
+	initr := &fakeInitiator{loginErr: errors.New("login failed: portal unreachable")}
+
+	if _, err := selfHealNode(fm, initr).NodePublishVolume(context.Background(), iscsiMountPublishRequest(staging, target)); err == nil {
+		t.Fatal("publish must report a self-heal whose login fails")
+	}
+	if initr.logins == 0 {
+		t.Fatal("the self-heal must have attempted the login before giving up")
+	}
+	for _, mp := range fm.MountPoints {
+		if mp.Path == target {
+			t.Fatalf("nothing may be bound onto the target on a failed self-heal: %v", fm.MountPoints)
+		}
 	}
 }

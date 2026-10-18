@@ -17,6 +17,11 @@ import (
 // sysfsRoot is a var so tests can point the walk at a fabricated tree.
 var sysfsRoot = "/sys"
 
+// devDir is the directory the session walk resolves block device nodes into.
+// Var so tests can point it at the same fabricated tree as sysfsRoot, where
+// the stand-in /dev/<name> nodes live.
+var devDir = "/dev"
+
 var sessionRe = regexp.MustCompile(`(^|/)(session\d+)(/|$)`)
 
 var targetRe = regexp.MustCompile(`^target\d+:\d+:\d+$`)
@@ -278,7 +283,7 @@ func sessionDevice(session, iqn string, lun int, classDir string) (string, error
 			}
 			if len(blocks) > 0 {
 				// ReadDir sorts by name, so the pick is deterministic.
-				return filepath.Join("/dev", blocks[0].Name()), nil
+				return filepath.Join(devDir, blocks[0].Name()), nil
 			}
 		}
 	}

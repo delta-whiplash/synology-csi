@@ -323,8 +323,13 @@ func (ns *nodeServer) loginTarget(volumeId string) (paths []string, iqn string, 
 
 		path := fmt.Sprintf("%sip-%s-iscsi-%s-lun-%d", "/dev/disk/by-path/", portal, iqn, lun)
 		if err := waitForDevicePathToExist(path); err != nil {
-			log.Errorf("Can't find device path [%s]: %v", path, err)
-			return nil, "", 0, status.Errorf(codes.Internal, fmt.Sprintf("Can't find device path [%s]: %v", path, err))
+			// The by-path links are udev's work: on udev-less nodes (Talos)
+			// they never appear although the login and the rescan succeeded.
+			// stageIscsiAt discovers the device from sysfs instead and only
+			// falls back to these links, so their absence is not a failed
+			// stage -- skip them and keep the login.
+			log.Warnf("Can't find device path [%s]: %v", path, err)
+			continue
 		}
 
 		paths = append(paths, path)
@@ -628,9 +633,17 @@ func (ns *nodeServer) stageIscsiAt(stagingTargetPath, volumeId string, mountVolu
 		return err
 	}
 
-	volumeMountPath := getVolumeMountPath(iscsiDevPaths)
-	if volumeMountPath == "" {
-		return errors.New("Can't get volume mount path")
+	// Primary source: the kernel's own view of the session. udev-less nodes
+	// (Talos) never create the /dev/disk/by-path links, so discovery has to
+	// start from the session the kernel actually recorded; the by-path links
+	// stay as the fallback for the nodes that do have them.
+	volumeMountPath, findErr := findSessionDevice(iqn, lun, sysfsRoot)
+	if findErr != nil {
+		log.Warnf("sysfs discovery of target[%s] lun %d failed (%v), falling back to the by-path links", iqn, lun, findErr)
+		volumeMountPath = getVolumeMountPath(iscsiDevPaths)
+		if volumeMountPath == "" {
+			return fmt.Errorf("can't resolve the block device of target[%s] lun %d: %v", iqn, lun, findErr)
+		}
 	}
 
 	// Mount the resolved device, not the link: a by-path link repointed after
@@ -991,24 +1004,28 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		// the node's own partition. Only raw-block volumes skip staging and
 		// need a device path here.
 		if !isBlock {
-			if mounted, err := isStillMounted(ns.Mounter.Interface, stagingTargetPath); err != nil {
+			mounted, err := isStillMounted(ns.Mounter.Interface, stagingTargetPath)
+			if err != nil {
 				return nil, status.Error(codes.Internal, err.Error())
-			} else if !mounted {
-				// Bind-staging contract: publishing over an unstaged directory
-				// would give the pod a silently empty filesystem.
-				return nil, status.Error(codes.FailedPrecondition,
-					"staging target is not mounted: stage must complete before publish")
 			}
 			// The kubelet can skip staging when its cached state says "already
 			// staged", leaving whatever the staging path held at reconstruction
 			// time -- observed in production as a pod living on the node's own
-			// partition. Verify the backing device is an iSCSI whole disk.
-			if dev, ok := stagingMountSource(stagingTargetPath); !ok || dev == "" {
-				return nil, status.Error(codes.FailedPrecondition,
-					"staging target has no backing device in the mount table")
-			} else if err := requireIscsiDisk(dev, sysfsRoot); err != nil {
-				return nil, status.Errorf(codes.FailedPrecondition,
-					"staging target is not backed by a verified iSCSI disk: %v", err)
+			// partition, or holding nothing at all. When the staging does not
+			// provably carry an iSCSI disk, rebuild it instead of refusing:
+			// the refusal wedged pods forever, the kubelet never re-stages on
+			// its own.
+			if !stagingBackedByIscsiDisk(stagingTargetPath) {
+				log.Warnf("NodePublishVolume: staging %s does not hold a verified iSCSI disk (mounted: %v), self-healing it",
+					stagingTargetPath, mounted)
+				if err := ns.selfHealIscsiStaging(stagingTargetPath, volumeId, mounted, req.GetVolumeCapability().GetMount()); err != nil {
+					return nil, status.Errorf(codes.FailedPrecondition,
+						"staging target is not backed by a verified iSCSI disk and healing it failed: %v", err)
+				}
+				if !stagingBackedByIscsiDisk(stagingTargetPath) {
+					return nil, status.Error(codes.FailedPrecondition,
+						"staging target still does not hold a verified iSCSI disk after the self-heal")
+				}
 			}
 			if err := ns.Mounter.Interface.Mount(stagingTargetPath, targetPath, fsType, options); err != nil {
 				return nil, status.Error(codes.Internal, err.Error())
@@ -1038,6 +1055,51 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	}
 
 	return &csi.NodePublishVolumeResponse{}, nil
+}
+
+// stagingBackedByIscsiDisk reports whether the staging path carries a live
+// mount whose backing device proves to be an iSCSI whole disk. Any doubt --
+// unmounted, no mount-table entry, unverifiable device -- is a no.
+func stagingBackedByIscsiDisk(stagingTargetPath string) bool {
+	dev, ok := stagingMountSource(stagingTargetPath)
+	if !ok || dev == "" {
+		return false
+	}
+	return requireIscsiDisk(dev, sysfsRoot) == nil
+}
+
+// selfHealIscsiStaging rebuilds a staging path that does not hold the volume's
+// LUN: peel every mount layer off it (the same bounded peel as
+// NodeUnpublishVolume), then re-run the whole staging sequence against the
+// volume -- login included, existing sessions are reused by the initiator.
+// The caller re-verifies the rebuilt staging's backing before binding
+// anything, so a rebuild that ends up wrong still fails the publish.
+func (ns *nodeServer) selfHealIscsiStaging(stagingTargetPath, volumeId string, mounted bool, mountVolume *csi.VolumeCapability_MountVolume) error {
+	if mounted {
+		for i := 0; i < maxUnmountPeels; i++ {
+			still, err := isStillMounted(ns.Mounter.Interface, stagingTargetPath)
+			if err != nil {
+				return fmt.Errorf("couldn't check whether %s is mounted: %v", stagingTargetPath, err)
+			}
+			if !still {
+				break
+			}
+			if err := ns.Mounter.Interface.Unmount(stagingTargetPath); err != nil {
+				return fmt.Errorf("failed to unmount the stale staging %s: %v", stagingTargetPath, err)
+			}
+		}
+		if still, err := isStillMounted(ns.Mounter.Interface, stagingTargetPath); err != nil {
+			return fmt.Errorf("couldn't check whether %s is mounted: %v", stagingTargetPath, err)
+		} else if still {
+			return fmt.Errorf("%s is still mounted after %d unmount attempts", stagingTargetPath, maxUnmountPeels)
+		}
+	}
+	// The kubelet guarantees the staging directory only on the stage path it
+	// just skipped; a self-heal makes no such assumption.
+	if err := os.MkdirAll(stagingTargetPath, 0o750); err != nil {
+		return fmt.Errorf("failed to create the staging directory %s: %v", stagingTargetPath, err)
+	}
+	return ns.stageIscsiAt(stagingTargetPath, volumeId, mountVolume, nil)
 }
 
 // isStillMounted reports whether path carries a live mount right now. The
