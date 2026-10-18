@@ -418,22 +418,122 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
-// ControllerPublishVolume is intentionally Unimplemented (matches upstream
-// v1.4.0). The driver does not declare the PUBLISH_UNPUBLISH_VOLUME capability
-// (see driver.go), so the CSI external-attacher never calls this RPC. The
-// existing detach path keeps working unchanged.
+// ControllerPublishVolume is a validation + synchronisation hook. The Synology
+// DSM exposes no host-level ACL/LUN-masking API (see pkg/dsm/webapi/iscsi.go:
+// only LunCreate/Update/Get/List/Clone/Delete, TargetCreate/Delete/Get/List/Set/
+// SetAuth, LunMapTarget; no per-initiator ACL, no LunUnmapTarget), so the
+// 1:1 target/LUN mapping created at volume provisioning time (createMappingTarget
+// in pkg/dsm/service/dsm.go) is the only mapping that will ever exist for a
+// volume. Re-issuing LunMapTarget here would be both pointless and racy.
 //
-// When CHAP lands as a complete feature (capability + publish + unpublish +
-// TargetSetAuth), this is where the per-volume auth will be applied. Until
-// then, do not wire secrets to SetTargetAuth here: secrets provided via
-// node-stage-secret do not reach ControllerPublishVolume, so any wiring would
-// be dead code or (worse) silently misapplied. Tracked, not shipped.
+// What this RPC therefore does:
+//   - validates the request (volumeId, nodeId, volumeCapability);
+//   - resolves the volume via GetVolume, surfacing NotFound / Unavailable;
+//   - returns early for NFS/SMB (share-backed volumes have no publish on DSM);
+//   - for iSCSI/NVMe, verifies the existing TargetInfo is internally
+//     consistent (non-empty IQN, at least one MappedLun) and bails with
+//     Internal otherwise — this is how we fail closed on a corrupted volume;
+//   - builds PublishContext{dsm, protocol, iqn, mappingIndex} so the node
+//     plugin can stage without re-querying the DSM.
+//
+// Idempotent: repeated calls return the same response and never mutate DSM.
 func (cs *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+	if req.GetNodeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "node id is required")
+	}
+	if req.GetVolumeCapability() == nil {
+		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
+	}
+
+	k8sVolume, err := cs.dsmService.GetVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable,
+			"failed to look up volume %s: %v", req.GetVolumeId(), err)
+	}
+	if k8sVolume == nil {
+		return nil, status.Errorf(codes.NotFound, "volume %s does not exist", req.GetVolumeId())
+	}
+
+	// NFS/SMB are share-backed: nothing to publish on DSM, nothing to hand
+	// to the node plugin — NodeStage uses the VolumeContext from the PV spec
+	// directly.
+	if isShareProtocol(k8sVolume.Protocol) {
+		return &csi.ControllerPublishVolumeResponse{}, nil
+	}
+
+	// iSCSI / NVMe: the mapping already exists (createMappingTarget at
+	// CreateVolume time). Validate the TargetInfo is sane and forward it
+	// to the node plugin via PublishContext.
+	target := k8sVolume.Target
+	if target.Iqn == "" {
+		return nil, status.Errorf(codes.Internal,
+			"volume %s is block-backed but has no target IQN; refusing to publish",
+			req.GetVolumeId())
+	}
+	if len(target.MappedLuns) == 0 {
+		return nil, status.Errorf(codes.Internal,
+			"volume %s has no mapped LUNs on target %s; refusing to publish",
+			req.GetVolumeId(), target.Iqn)
+	}
+
+	return &csi.ControllerPublishVolumeResponse{
+		PublishContext: map[string]string{
+			"dsm":          k8sVolume.DsmIp,
+			"protocol":     k8sVolume.Protocol,
+			"iqn":          target.Iqn,
+			"mappingIndex": strconv.Itoa(target.MappedLuns[0].MappingIndex),
+		},
+	}, nil
 }
 
+// ControllerUnpublishVolume is a synchronisation hook, not a DSM mutation.
+// The Synology DSM has no host-level ACL/LUN-masking and no LunUnmapTarget
+// API (see ControllerPublishVolume for the full rationale), so the only thing
+// we can do on detach is verify that the source node's iSCSI session is
+// already gone. If it is still present we return Unavailable and let the
+// external-attacher retry — by the time we are called the kubelet should
+// have run NodeUnstage on the source, which drops the session locally.
+//
+// NFS/SMB are share-backed and return OK immediately (no detach on DSM).
+// Idempotent: repeat calls and calls for a volume that has already vanished
+// both return OK, which matches the CSI contract the external-attacher
+// relies on during reconciliation.
 func (cs *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+
+	k8sVolume, err := cs.dsmService.GetVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable,
+			"failed to look up volume %s: %v", req.GetVolumeId(), err)
+	}
+	// Volume already gone: the mapping is gone with it, nothing to detach.
+	// Return OK so the external-attacher can finalize the VolumeAttachment.
+	if k8sVolume == nil {
+		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
+
+	if isShareProtocol(k8sVolume.Protocol) {
+		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
+
+	// iSCSI / NVMe: check whether the source node still holds an active
+	// session on the target. The node ID doubles as the initiator IQN in
+	// this driver (see createMappingTarget in pkg/dsm/service/dsm.go).
+	sourceNode := req.GetNodeId()
+	for _, session := range k8sVolume.Target.ConnectedSessions {
+		if session.Iqn == sourceNode {
+			return nil, status.Errorf(codes.Unavailable,
+				"source node %s still holds an active session on target %s; retrying",
+				sourceNode, k8sVolume.Target.Iqn)
+		}
+	}
+
+	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
 func (cs *controllerServer) ValidateVolumeCapabilities(ctx context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {

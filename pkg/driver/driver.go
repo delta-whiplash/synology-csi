@@ -72,11 +72,15 @@ func NewControllerAndNodeDriver(nodeID string, endpoint string, dsmService inter
 		csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
 		csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
 		csi.ControllerServiceCapability_RPC_GET_CAPACITY,
-		// NOTE: RPC_PUBLISH_UNPUBLISH_VOLUME is intentionally NOT declared
-		// (matches upstream v1.4.0). Without the capability, the CSI external-
-		// attacher will never call ControllerPublish/UnpublishVolume, so the
-		// existing detach path keeps working unchanged. CHAP (when it lands)
-		// will be wired together with this capability in a single feature PR.
+		// PUBLISH_UNPUBLISH_VOLUME is declared so the CSI external-attacher
+		// invokes ControllerPublish/UnpublishVolume. The Synology DSM exposes
+		// no host-level ACL/LUN-masking API, so the handlers do not mutate
+		// DSM state — they validate the volume topology and (on unpublish)
+		// wait for the source node's iSCSI session to drop before letting
+		// the external-attacher finalize the VolumeAttachment. See
+		// pkg/driver/controllerserver.go ControllerPublishVolume /
+		// ControllerUnpublishVolume for the full rationale.
+		csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 	})
 
 	d.addVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{
