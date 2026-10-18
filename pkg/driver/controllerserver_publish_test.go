@@ -100,7 +100,7 @@ func newPublishController(dsm *publishFakeDsm) *controllerServer {
 	return &controllerServer{dsmService: dsm}
 }
 
-func iscsiVolume(t *testing.T, iqn string, mappingIndex int, sessions []webapi.ConncetedSession) *models.K8sVolumeRespSpec {
+func iscsiVolume(t *testing.T, iqn string, mappingIndex int, sessions []webapi.ConnectedSession) *models.K8sVolumeRespSpec {
 	t.Helper()
 	return &models.K8sVolumeRespSpec{
 		DsmIp:    "10.0.0.1",
@@ -120,6 +120,22 @@ func shareVolume(protocol string) *models.K8sVolumeRespSpec {
 		VolumeId: "vol-share-1",
 		Protocol: protocol,
 		Share:    webapi.ShareInfo{Name: "share-1"},
+	}
+}
+
+func nvmeVolume(nqn string, namespaceUuid string) *models.K8sVolumeRespSpec {
+	return &models.K8sVolumeRespSpec{
+		DsmIp:    "10.0.0.1",
+		VolumeId: "vol-nvme-1",
+		Protocol: utils.ProtocolNvme,
+		Subsystem: webapi.SubsystemInfo{
+			Uuid: "subsystem-uuid-1",
+			Nqn:  nqn,
+		},
+		Namespace: webapi.NamespaceInfo{
+			Uuid:          namespaceUuid,
+			SubsystemUuid: "subsystem-uuid-1",
+		},
 	}
 }
 
@@ -314,6 +330,82 @@ func TestControllerPublish_SMB_NoOp(t *testing.T) {
 	}
 }
 
+func TestControllerPublish_NVMe_HappyPath(t *testing.T) {
+	fake := &publishFakeDsm{
+		getVolume: func(string) (*models.K8sVolumeRespSpec, error) {
+			return nvmeVolume("nqn.2021-08.com.synology:csi.k8s-csi-vol-1", "ns-uuid-1"), nil
+		},
+	}
+	cs := newPublishController(fake)
+	resp, err := cs.ControllerPublishVolume(context.Background(),
+		publishRequest("vol-nvme-1", "node-1", oneMountCap()))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := map[string]string{
+		"dsm":           "10.0.0.1",
+		"protocol":      utils.ProtocolNvme,
+		"nqn":           "nqn.2021-08.com.synology:csi.k8s-csi-vol-1",
+		"namespaceUuid": "ns-uuid-1",
+	}
+	for k, v := range want {
+		if resp.PublishContext[k] != v {
+			t.Errorf("PublishContext[%s] = %q, want %q", k, resp.PublishContext[k], v)
+		}
+	}
+	if fake.mutateCount != 0 {
+		t.Errorf("NVMe publish must not mutate DSM, got %d calls", fake.mutateCount)
+	}
+}
+
+func TestControllerPublish_NVMe_CorruptedVolume_NoNqn(t *testing.T) {
+	cs := newPublishController(&publishFakeDsm{
+		getVolume: func(string) (*models.K8sVolumeRespSpec, error) {
+			return nvmeVolume("", "ns-uuid-1"), nil
+		},
+	})
+	_, err := cs.ControllerPublishVolume(context.Background(),
+		publishRequest("vol-nvme-1", "node-1", oneMountCap()))
+	if codeOf(err) != codes.Internal {
+		t.Fatalf("want Internal, got %v", err)
+	}
+}
+
+func TestControllerPublish_NVMe_CorruptedVolume_NoNamespace(t *testing.T) {
+	cs := newPublishController(&publishFakeDsm{
+		getVolume: func(string) (*models.K8sVolumeRespSpec, error) {
+			return nvmeVolume("nqn.2021-08.com.synology:csi.k8s-csi-vol-1", ""), nil
+		},
+	})
+	_, err := cs.ControllerPublishVolume(context.Background(),
+		publishRequest("vol-nvme-1", "node-1", oneMountCap()))
+	if codeOf(err) != codes.Internal {
+		t.Fatalf("want Internal, got %v", err)
+	}
+}
+
+func TestControllerPublish_NVMe_Idempotent(t *testing.T) {
+	fake := &publishFakeDsm{
+		getVolume: func(string) (*models.K8sVolumeRespSpec, error) {
+			return nvmeVolume("nqn.2021-08.com.synology:csi.k8s-csi-vol-1", "ns-uuid-1"), nil
+		},
+	}
+	cs := newPublishController(fake)
+	req := publishRequest("vol-nvme-1", "node-1", oneMountCap())
+	for i := 0; i < 2; i++ {
+		resp, err := cs.ControllerPublishVolume(context.Background(), req)
+		if err != nil {
+			t.Fatalf("call %d: unexpected error: %v", i, err)
+		}
+		if resp.PublishContext["nqn"] != "nqn.2021-08.com.synology:csi.k8s-csi-vol-1" {
+			t.Fatalf("call %d: nqn mismatch", i)
+		}
+	}
+	if fake.mutateCount != 0 {
+		t.Errorf("NVMe publish must never mutate DSM, got %d", fake.mutateCount)
+	}
+}
+
 // --- ControllerUnpublishVolume ------------------------------------------------
 
 func TestControllerUnpublish_InvalidArg_NoVolumeId(t *testing.T) {
@@ -371,7 +463,7 @@ func TestControllerUnpublish_ISCSI_SourceStillConnected(t *testing.T) {
 	fake := &publishFakeDsm{
 		getVolume: func(string) (*models.K8sVolumeRespSpec, error) {
 			return iscsiVolume(t, "iqn.2021-08.com.synology:csi-k8s-csi-vol-1", 1,
-				[]webapi.ConncetedSession{{Iqn: sourceIqn, Ip: "10.0.0.5"}}), nil
+				[]webapi.ConnectedSession{{Iqn: sourceIqn, Ip: "10.0.0.5"}}), nil
 		},
 	}
 	cs := newPublishController(fake)
@@ -393,6 +485,26 @@ func TestControllerUnpublish_NFS_NoOp(t *testing.T) {
 	}
 	if fake.mutateCount != 0 {
 		t.Errorf("NFS unpublish must not mutate DSM, got %d calls", fake.mutateCount)
+	}
+}
+
+func TestControllerUnpublish_NVMe_NoOp(t *testing.T) {
+	// NVMe-oF returns OK unconditionally: the DSM webapi layer does not
+	// expose connected-initiator information for subsystems, so no session
+	// check is possible. The volume is gone from the CSI perspective, which
+	// is the contract the external-attacher needs to finalize.
+	fake := &publishFakeDsm{
+		getVolume: func(string) (*models.K8sVolumeRespSpec, error) {
+			return nvmeVolume("nqn.2021-08.com.synology:csi.k8s-csi-vol-1", "ns-uuid-1"), nil
+		},
+	}
+	cs := newPublishController(fake)
+	if _, err := cs.ControllerUnpublishVolume(context.Background(),
+		&csi.ControllerUnpublishVolumeRequest{VolumeId: "vol-nvme-1", NodeId: "node-1"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.mutateCount != 0 {
+		t.Errorf("NVMe unpublish must not mutate DSM, got %d calls", fake.mutateCount)
 	}
 }
 

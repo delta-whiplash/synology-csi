@@ -430,11 +430,14 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 //   - validates the request (volumeId, nodeId, volumeCapability);
 //   - resolves the volume via GetVolume, surfacing NotFound / Unavailable;
 //   - returns early for NFS/SMB (share-backed volumes have no publish on DSM);
-//   - for iSCSI/NVMe, verifies the existing TargetInfo is internally
-//     consistent (non-empty IQN, at least one MappedLun) and bails with
-//     Internal otherwise — this is how we fail closed on a corrupted volume;
-//   - builds PublishContext{dsm, protocol, iqn, mappingIndex} so the node
-//     plugin can stage without re-querying the DSM.
+//   - for iSCSI, verifies the existing TargetInfo is internally consistent
+//     (non-empty IQN, at least one MappedLun) and bails with Internal
+//     otherwise — this is how we fail closed on a corrupted volume;
+//   - for NVMe, verifies the Subsystem NQN is non-empty (the DSM webapi layer
+//     does not expose connected-initiator information for NVMe-oF subsystems,
+//     so no session check is possible here — see pkg/dsm/webapi/nvmeof.go);
+//   - builds PublishContext{dsm, protocol, iqn|nqn, mappingIndex|namespaceUuid}
+//     so the node plugin can stage without re-querying the DSM.
 //
 // Idempotent: repeated calls return the same response and never mutate DSM.
 func (cs *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
@@ -464,13 +467,38 @@ func (cs *controllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 		return &csi.ControllerPublishVolumeResponse{}, nil
 	}
 
-	// iSCSI / NVMe: the mapping already exists (createMappingTarget at
-	// CreateVolume time). Validate the TargetInfo is sane and forward it
-	// to the node plugin via PublishContext.
+	// NVMe-oF: the DSM webapi layer does not expose connected-initiator
+	// information for subsystems (see SubsystemInfo in pkg/dsm/webapi/nvmeof.go),
+	// so we cannot run the session check that iSCSI does. Validate that the
+	// subsystem NQN is populated and forward it to the node plugin.
+	if k8sVolume.Protocol == utils.ProtocolNvme {
+		if k8sVolume.Subsystem.Nqn == "" {
+			return nil, status.Errorf(codes.Internal,
+				"volume %s is NVMe-backed but has no subsystem NQN; refusing to publish",
+				req.GetVolumeId())
+		}
+		if k8sVolume.Namespace.Uuid == "" {
+			return nil, status.Errorf(codes.Internal,
+				"volume %s has no namespace UUID; refusing to publish",
+				req.GetVolumeId())
+		}
+		return &csi.ControllerPublishVolumeResponse{
+			PublishContext: map[string]string{
+				"dsm":           k8sVolume.DsmIp,
+				"protocol":      k8sVolume.Protocol,
+				"nqn":           k8sVolume.Subsystem.Nqn,
+				"namespaceUuid": k8sVolume.Namespace.Uuid,
+			},
+		}, nil
+	}
+
+	// iSCSI: the mapping already exists (createMappingTarget at CreateVolume
+	// time). Validate the TargetInfo is sane and forward it to the node
+	// plugin via PublishContext.
 	target := k8sVolume.Target
 	if target.Iqn == "" {
 		return nil, status.Errorf(codes.Internal,
-			"volume %s is block-backed but has no target IQN; refusing to publish",
+			"volume %s is iSCSI-backed but has no target IQN; refusing to publish",
 			req.GetVolumeId())
 	}
 	if len(target.MappedLuns) == 0 {
@@ -492,12 +520,18 @@ func (cs *controllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 // ControllerUnpublishVolume is a synchronisation hook, not a DSM mutation.
 // The Synology DSM has no host-level ACL/LUN-masking and no LunUnmapTarget
 // API (see ControllerPublishVolume for the full rationale), so the only thing
-// we can do on detach is verify that the source node's iSCSI session is
-// already gone. If it is still present we return Unavailable and let the
+// we can do on detach is verify that the source node's session is already
+// gone. If it is still present we return Unavailable and let the
 // external-attacher retry — by the time we are called the kubelet should
 // have run NodeUnstage on the source, which drops the session locally.
 //
 // NFS/SMB are share-backed and return OK immediately (no detach on DSM).
+// NVMe-oF returns OK unconditionally: the DSM webapi layer does not expose
+// connected-initiator information for subsystems (see SubsystemInfo in
+// pkg/dsm/webapi/nvmeof.go), so no session check is possible here. A
+// periodic stale-session reconciler on the node plugin would close this gap
+// for NVMe (and iSCSI) — tracked as a TODO, not wired yet.
+//
 // Idempotent: repeat calls and calls for a volume that has already vanished
 // both return OK, which matches the CSI contract the external-attacher
 // relies on during reconciliation.
@@ -521,9 +555,21 @@ func (cs *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 
-	// iSCSI / NVMe: check whether the source node still holds an active
-	// session on the target. The node ID doubles as the initiator IQN in
-	// this driver (see createMappingTarget in pkg/dsm/service/dsm.go).
+	// NVMe-oF: the DSM webapi layer does not expose connected-initiator
+	// information for subsystems, so we cannot run the session check that
+	// iSCSI does. Return OK unconditionally — the mapping is gone with the
+	// volume, and there is no DSM state to clean up.
+	// TODO(nodeReconciler): a periodic stale-session reconciler on the node
+	// plugin would detect and log out orphaned NVMe sessions (and iSCSI ones
+	// the kubelet missed), closing this observability gap. Tracked, not
+	// shipped — see the implementation plan in the project notes.
+	if k8sVolume.Protocol == utils.ProtocolNvme {
+		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
+
+	// iSCSI: check whether the source node still holds an active session on
+	// the target. The node ID doubles as the initiator IQN in this driver
+	// (see createMappingTarget in pkg/dsm/service/dsm.go).
 	sourceNode := req.GetNodeId()
 	for _, session := range k8sVolume.Target.ConnectedSessions {
 		if session.Iqn == sourceNode {

@@ -5,12 +5,12 @@ package webapi
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/SynologyOpenSource/synology-csi/pkg/logger"
+	"github.com/SynologyOpenSource/synology-csi/pkg/utils"
+	log "github.com/sirupsen/logrus"
 	"net/url"
 	"strconv"
 	"strings"
-	log "github.com/sirupsen/logrus"
-	"github.com/SynologyOpenSource/synology-csi/pkg/logger"
-	"github.com/SynologyOpenSource/synology-csi/pkg/utils"
 )
 
 type LunInfo struct {
@@ -31,7 +31,7 @@ type MappedLun struct {
 	MappingIndex int    `json:"mapping_index"`
 }
 
-type ConncetedSession struct {
+type ConnectedSession struct {
 	Iqn string `json:"iqn"`
 	Ip  string `json:"ip"`
 }
@@ -47,7 +47,7 @@ type TargetInfo struct {
 	Status            string             `json:"status"`
 	MaxSessions       int                `json:"max_sessions"`
 	MappedLuns        []MappedLun        `json:"mapped_luns"`
-	ConnectedSessions []ConncetedSession `json:"connected_sessions"`
+	ConnectedSessions []ConnectedSession `json:"connected_sessions"`
 	NetworkPortals    []NetworkPortal    `json:"network_portals"`
 	TargetId          int                `json:"target_id"`
 }
@@ -72,9 +72,9 @@ type LunUpdateSpec struct {
 }
 
 type LunCloneSpec struct {
-	Name            string
-	SrcLunUuid      string
-	Location        string
+	Name       string
+	SrcLunUuid string
+	Location   string
 }
 
 type TargetCreateSpec struct {
@@ -302,11 +302,12 @@ func (dsm *DSM) TargetSet(targetId string, maxSession int) error {
 // without re-adding the webapi layer. The driver-level wiring
 // (ControllerPublishVolume reading chapUser/chapPassword from req.GetSecrets()
 // and calling service.SetTargetAuth) was removed from patch 0004 because:
-//   1. The PUBLISH_UNPUBLISH_VOLUME capability is not declared (driver.go),
-//      so ControllerPublishVolume is never called by the external-attacher.
-//   2. StorageClass `csi.storage.k8s.io/node-stage-secret` is delivered to
-//      NodeStageVolume, NOT to ControllerPublishVolume — so even if the
-//      capability were added, the secrets would not reach the handler.
+//  1. The PUBLISH_UNPUBLISH_VOLUME capability is not declared (driver.go),
+//     so ControllerPublishVolume is never called by the external-attacher.
+//  2. StorageClass `csi.storage.k8s.io/node-stage-secret` is delivered to
+//     NodeStageVolume, NOT to ControllerPublishVolume — so even if the
+//     capability were added, the secrets would not reach the handler.
+//
 // The complete CHAP feature will require: capability declaration, a secret
 // path that actually reaches ControllerPublish (likely provisioner-secret or
 // a dedicated controller secret ref), AND a ControllerUnpublishVolume that
