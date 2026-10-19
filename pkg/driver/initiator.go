@@ -30,6 +30,17 @@ import (
 	utilexec "k8s.io/utils/exec"
 )
 
+// initiator is the slice of the iSCSI initiator the node server consumes:
+// login to (re-)establish a session when staging or self-healing a publish,
+// logout and rescan for teardown and expand. Typed as an interface so tests
+// can stand the initiator in and observe which logins ran without touching a
+// host.
+type initiator interface {
+	login(targetIqn string, portal string) error
+	logout(targetIqn string, ip string) error
+	rescan(targetIqn string) error
+}
+
 type initiatorDriver struct {
 	chapUser     string
 	chapPassword string
