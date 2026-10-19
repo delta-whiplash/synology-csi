@@ -23,6 +23,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1188,6 +1189,11 @@ func (ns *nodeServer) lookupIscsiVolume(volumeId string) (*models.K8sVolumeRespS
 	return k8sVolume, nil
 }
 
+// listProcMounts reads the authoritative mount table. Var so tests can
+// substitute a fake mount table without touching the real /proc/mounts on
+// the test host.
+var listProcMounts = mount.ListProcMounts
+
 // isStillMounted reports whether path carries a live mount right now. The
 // "likely" fast check cannot see bind mounts of plain directories, so the
 // authoritative /proc/mounts table decides. Var so tests can point it at a
@@ -1198,7 +1204,7 @@ var isStillMounted = func(mounter mount.Interface, path string) (bool, error) {
 	if real, err := filepath.EvalSymlinks(path); err == nil {
 		path = real
 	}
-	mounts, err := mount.ListProcMounts("/proc/mounts")
+	mounts, err := listProcMounts("/proc/mounts")
 	if err != nil {
 		return false, err
 	}
@@ -1213,7 +1219,7 @@ var isStillMounted = func(mounter mount.Interface, path string) (bool, error) {
 // stagingMountSource returns the device backing a mounted staging path, per
 // the authoritative mount table. Var so tests can point it at a fake table.
 var stagingMountSource = func(path string) (string, bool) {
-	mounts, err := mount.ListProcMounts("/proc/mounts")
+	mounts, err := listProcMounts("/proc/mounts")
 	if err != nil {
 		return "", false
 	}
@@ -1226,6 +1232,58 @@ var stagingMountSource = func(path string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// unmountSubMounts tears down every mount that lives strictly below root,
+// deepest first. The kernel refuses to unmount a parent while a child is
+// still attached, so depth-descending order is required for the sweep to
+// make progress on stacked mounts (e.g. Bidirectional-propagated bind
+// mounts from the host's kubelet-dir into a pod volume).
+//
+// Errors from individual Unmount calls are returned immediately: if a
+// sub-mount cannot be released, the parent targetPath removal will fail
+// ENOTEMPTY anyway and we want the caller to surface that instead of
+// silently returning success.
+func unmountSubMounts(ns *nodeServer, root string) error {
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		// Path vanished between Stat and here — nothing to clean up.
+		return nil
+	}
+	prefix := realRoot + "/"
+
+	mounts, err := listProcMounts("/proc/mounts")
+	if err != nil {
+		return err
+	}
+
+	// Collect every mount whose resolved path is a strict descendant of
+	// root. mp.Path is already resolved by the kernel (it resolves
+	// symlinks at mount time), so a lexical prefix match is correct.
+	var subs []string
+	for _, mp := range mounts {
+		if strings.HasPrefix(mp.Path, prefix) {
+			subs = append(subs, mp.Path)
+		}
+	}
+	if len(subs) == 0 {
+		return nil
+	}
+
+	// Depth-descending: deeper paths first. On a stack like
+	// root/a/b/c -> root/a/b -> root/a, tearing down c first is the only
+	// order the kernel accepts.
+	sort.SliceStable(subs, func(i, j int) bool {
+		return strings.Count(subs[i], "/") > strings.Count(subs[j], "/")
+	})
+
+	for _, p := range subs {
+		log.Infof("NodeUnpublishVolume: unmounting propagated sub-mount %s (under %s)", p, root)
+		if err := ns.Mounter.Interface.Unmount(p); err != nil {
+			return fmt.Errorf("unmount sub-mount %s: %w", p, err)
+		}
+	}
+	return nil
 }
 
 // maxUnmountPeels bounds the stacked-bind teardown of one call; kubelet
@@ -1254,6 +1312,20 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	// iSCSI sessions logged in forever: kubelet retries unpublish, never
 	// reaches unstage, and the next attach is refused Multi-Attach. Peel the
 	// layers against the authoritative mount table instead.
+	//
+	// Before peeling the main bind mount, sweep any propagated sub-mounts
+	// below targetPath. With Bidirectional mountPropagation (set on the
+	// kubelet-dir host mount in the driver DaemonSet), mounts created inside
+	// the container propagate back to the host and can appear below this
+	// targetPath. isStillMounted only checks the exact path, so those
+	// sub-mounts survived the peel loop, os.Remove below then failed with
+	// ENOTEMPTY, kubelet's pod-dir GC hit the same error, and the pod was
+	// stuck in volumesInUse forever — NodeUnstageVolume (which logs out the
+	// iSCSI session) was never reached.
+	if err := unmountSubMounts(ns, targetPath); err != nil {
+		return nil, status.Errorf(codes.Internal, "Failed to unmount sub-mounts under %s: %v", targetPath, err)
+	}
+
 	for i := 0; i < maxUnmountPeels; i++ {
 		mounted, err := isStillMounted(ns.Mounter.Interface, targetPath)
 		if err != nil {
@@ -1275,10 +1347,17 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 
 	if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
 		if errors.Is(err, unix.ENOTEMPTY) || errors.Is(err, unix.EEXIST) {
-			// The mount is verifiably gone; whatever sits in the directory is
-			// leftover content for the kubelet's pod-dir GC, not a reason to
-			// wedge this pod's deletion forever.
-			log.Infof("NodeUnpublishVolume: %s still has leftover content, leaving it to kubelet GC", targetPath)
+			// The sub-mount sweep above handled every live mount we could
+			// see in /proc/mounts, but leftover non-mount content (stale
+			// files from a container that wrote into a vanished bind mount,
+			// or a sub-mount that raced us) can still block os.Remove.
+			// Fall back to a recursive remove so kubelet can finish
+			// tearing the pod down; returning success without clearing
+			// the directory just re-produces the original deadlock.
+			log.Infof("NodeUnpublishVolume: %s still has leftover content, removing recursively", targetPath)
+			if rmErr := os.RemoveAll(targetPath); rmErr != nil {
+				return nil, status.Errorf(codes.Internal, "Failed to remove leftover content at %s: %v", targetPath, rmErr)
+			}
 			return &csi.NodeUnpublishVolumeResponse{}, nil
 		}
 		return nil, status.Errorf(codes.Internal, "Failed to remove target path: %v", err)
